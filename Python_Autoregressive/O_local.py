@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import copy
 
 '''################## Class and function definitions, can skip #############'''
 
@@ -75,8 +76,8 @@ class Psi:
 
     def apply_energy_gradient(self,s,E_loc,E, lr=0.03): # add Pytorch optimizer) (fixed lr for now)
         
-        N_samples=s.size(0)
-        outr = self.real_comp(s) #.flatten()
+#        N_samples=s.size(0)
+        outr = self.real_comp(s).flatten()
         
         E=np.conj(E)
         E_loc=np.conj(E_loc)
@@ -86,18 +87,22 @@ class Psi:
         if self.form.lower()=='euler':
             # each form has a slightly different multiplication form
             with torch.no_grad():
-                multiplier = 2*np.real(np.divide(diff[:,None],outr.detach().numpy())) 
+                multiplier= 2*np.real(diff/outr.detach().numpy())             
+                #multiplier = 2*np.real(np.divide(diff[:,None],outr.detach().numpy())) 
                 #multiplier = 2*np.real(E_loc)
         elif self.form.lower()=='vector':
             if np.all(self.complex==0):
                 self.complex_out(self,s) # define self.complex
             
             with torch.no_grad():
-                multiplier = 2*np.real((E_loc-E)/self.complex.flatten())
+                multiplier = 2*np.real(diff/self.complex.flatten())
                 #multiplier = 2*np.real(E_loc)
                 
+        multiplier=torch.tensor(multiplier,dtype=torch.float)
         self.real_comp.zero_grad()
-        outr.backward(torch.tensor((1/N_samples)*multiplier)*outr.detach())
+        (multiplier*outr).mean().backward()
+#        outr.backward(torch.tensor((1/N_samples)*multiplier)*outr)
+        
         # calling this applies autograd to only tensor .grad object i.e. out
         # which corresponds to dpsi_real(s)/dpars. 
         # must include the averaging over # samples factor myself 
@@ -119,20 +124,22 @@ class Psi:
 
         # complex versions of the multiplier 
         if self.form.lower()=='euler':
-            #multiplier = 2*np.imag(E_loc)
-            multiplier = 2*np.real((E_loc-E)*1j)
-            # 2*np.real((E_loc-E)*1j) or 2*np.imag(-E_loc), but gettin sign err
+            multiplier = 2*np.imag(-E_loc)
+            # multiplier = 2*np.real((E_loc-E)*1j)
+            # 2*np.real((E_loc-E)*1j) or 2*np.imag(-E_loc)
             # note, to accelerate, Energy E could not appear here because it 
             # should be real. Where it is not are sampling/accuracy errors
             
         elif self.form.lower()=='vector':
             # self.complex should have been defined in previous section of method
             with torch.no_grad():
-                multiplier = 2*np.real(1j*(E_loc-E)/self.complex.flatten())
+                multiplier = 2*np.real(1j*diff/self.complex.flatten())
                 #multiplier = 2*np.imag(E_loc)
-                
+        
+        multiplier=torch.tensor(multiplier,dtype=torch.float)
         self.imag_comp.zero_grad()
-        out.backward(torch.tensor((1/N_samples)*multiplier))#*out)
+        (multiplier*out).mean().backward()
+        #out.backward(torch.tensor((1/N_samples)*multiplier))#*out)
         
         params=list(self.imag_comp.parameters()) # get the parameters
         
@@ -359,7 +366,7 @@ Here is an example of how to use this function with a Pytorch neural network
 (here a simple FFNN created with the class Sequential)
 '''
 
-H=40 # hidden layer size
+H=2*L # hidden layer size
 N_samples=100
 
 s=np.random.randint(-1,high=1,size=[N_samples,L]); s[s==0]=1; 
@@ -372,7 +379,7 @@ toy_model=nn.Sequential(nn.Linear(L,H),
                         nn.Sigmoid()) # relu can be an important ending func as it
              #is always positive for which is necessary for applying log later
 
-H2=20
+H2=2*L
 toy_model2=nn.Sequential(nn.Linear(L,H2),
                         nn.Sigmoid(),
                         nn.Linear(H2,1),
@@ -516,55 +523,55 @@ with torch.no_grad():
 
 
 '''###### Let's start by testing the grad of just the avg. of out ##########'''
-N_samples=1
+N_samples=1000
 s=np.random.randint(-1,high=1,size=[N_samples,L]); s[s==0]=1; 
 
-K=21
-ratios=[]
-for i in range(1,K):
-    toy_model=nn.Sequential(nn.Linear(L,H),nn.Sigmoid(), nn.Linear(H,1),nn.Sigmoid())
-    mult=i/10
-    
-    with torch.no_grad():
-        for param in toy_model.parameters():
-            param.copy_(mult*torch.ones_like(param))
-    
-    out_0 = toy_model(torch.tensor(s,dtype=torch.float))
-    out_0.backward(out_0)
-    
-    pars=list(toy_model.parameters())
-    grad0=pars[0].grad #* (1/N_samples)
-    dw=0.001
-    with torch.no_grad():
-        pars[0][0][0]=pars[0][0][0]+dw
-        # to change all params by dw
-        #for param in toy_model.parameters():
-        #    param.copy_(mult*torch.ones_like(param)+dw*torch.ones_like(param))
-            
-    out_1=toy_model(torch.tensor(s,dtype=torch.float))
-    
-    deriv=(torch.mean(out_1)-torch.mean(out_0))/dw
-    
-    print('numberical deriv: ', deriv.item(), '\n pytorch deriv: ', grad0[0][0].item(), \
-            '\n ratio: ', deriv.item()/grad0[0][0].item() )
-    
-    ratios.append(deriv.item()/grad0[0][0].item())
+#K=11
+#ratios=[]
+#for i in range(1,K):
+toy_model=nn.Sequential(nn.Linear(L,H),nn.Sigmoid(),nn.Linear(H,1),nn.Sigmoid())
+mult=i/10
 
-plt.figure()
-plt.plot([i/10 for i in range(1,K)],ratios)
+#    with torch.no_grad():
+#        for param in toy_model.parameters():
+#            param.copy_(mult*torch.ones_like(param))
+
+out_0 = toy_model(torch.tensor(s,dtype=torch.float))
+out_0.mean().backward()
+
+pars=list(toy_model.parameters())
+grad0=pars[0].grad #* (1/N_samples)
+dw=0.01 # sometimes less accurate when smaller than 1e-3
+with torch.no_grad():
+    pars[0][0][0]=pars[0][0][0]+dw
+    # to change all params by dw
+    #for param in toy_model.parameters():
+    #    param.copy_(mult*torch.ones_like(param)+dw*torch.ones_like(param))
+        
+out_1=toy_model(torch.tensor(s,dtype=torch.float))
+
+deriv=(torch.mean(out_1)-torch.mean(out_0))/dw
+
+print('numberical deriv: ', deriv.item(), '\n pytorch deriv: ', grad0[0][0].item(), \
+        '\n ratio: ', deriv.item()/grad0[0][0].item() )
+
+#ratios.append(deriv.item()/grad0[0][0].item())
+#
+#plt.figure()
+#plt.plot([i/10 for i in range(1,K)],ratios)
 # strangely, the accuracy increases with the avg value in the NN
 # also, the increasing the # hidden nodes reduces acc. (likely in numerical tho)
 
 '''################### Checking the gradient method ########################'''
 
-N_samples=30
+N_samples=200
 s=np.random.randint(-1,high=1,size=[N_samples,L]); s[s==0]=1; 
 ## the following gives a gradient of 0 for some reason:
 #s=np.ones([N_samples,L])
 #s[:,1]=-1
 
 
-def vec_init(L, H=40, mult=0.3):
+def vec_init(L, H=2*L, mult=None):
     toy_model=nn.Sequential(nn.Linear(L,H),nn.Sigmoid(), nn.Linear(H,1),nn.Sigmoid()) 
     H2=round(H/2)
     toy_model2=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),nn.Linear(H2,1),nn.Sigmoid()) 
@@ -572,14 +579,15 @@ def vec_init(L, H=40, mult=0.3):
     ppsi_vec=Psi(toy_model,toy_model2, L, form='vector')
     
     # set the starting param to a certain value so we can test consistency
-    with torch.no_grad():
-        for param in ppsi_vec.real_comp.parameters():
-            param.copy_(mult*torch.ones_like(param))
-        for param in ppsi_vec.imag_comp.parameters():
-            param.copy_(mult*torch.ones_like(param))
+    if mult is not None:
+        with torch.no_grad():
+            for param in ppsi_vec.real_comp.parameters():
+                param.copy_(mult*torch.ones_like(param))
+            for param in ppsi_vec.imag_comp.parameters():
+                param.copy_(mult*torch.ones_like(param))
     return ppsi_vec
 
-def mod_init(L, H=40, mult=0.3):
+def mod_init(L, H=2*L, mult=None):
     
     m=nn.Sequential(nn.Linear(L,H),nn.Sigmoid(), nn.Linear(H,1),nn.Sigmoid()) 
     H2=round(H/2)
@@ -588,11 +596,12 @@ def mod_init(L, H=40, mult=0.3):
     
     ppsi_mod=Psi(m,m2, L, form='euler')
 
-    with torch.no_grad():
-        for param in ppsi_mod.real_comp.parameters():
-            param.copy_(mult*torch.ones_like(param))
-        for param in ppsi_mod.imag_comp.parameters():
-            param.copy_(mult*torch.ones_like(param))
+    if mult is not None:
+        with torch.no_grad():
+            for param in ppsi_mod.real_comp.parameters():
+                param.copy_(mult*torch.ones_like(param))
+            for param in ppsi_mod.imag_comp.parameters():
+                param.copy_(mult*torch.ones_like(param))
     return ppsi_mod
 
 # assign the params
@@ -623,8 +632,8 @@ modi_params=list(ppsi_mod.imag_comp.parameters())
 
 
 # is important to re-initialize before testing for ensuring the gradient isn't applied
-H,mult=6,0.1
-ppsi_vec=vec_init(L,H,mult)
+H,mult=6,0.5
+ppsi_vec=vec_init(L,H)
 vecr_params=list(ppsi_vec.real_comp.parameters())
 
 # starting by testing the vector version
@@ -635,19 +644,21 @@ del_wr=0.01 # delta w real
 energy=np.sum(np.mean(H_nn+H_b,axis=0)) 
 E_loc=np.sum(H_nn+H_b,axis=1)
 
+real_net=copy.deepcopy(ppsi_vec)
+
 # compare to the method derived gradient (using the original energy/params)
 [p1_r,p1_i]=ppsi_vec.apply_energy_gradient(torch.tensor(s,dtype=torch.float) \
                         ,E_loc,energy,0.03)
 
 # reset the parameter
-ppsi_vec=vec_init(L,H,mult)
-vecr_params=list(ppsi_vec.real_comp.parameters())
+#real_net=vec_init(L,H,mult)
+vecr_params=list(real_net.real_comp.parameters())
 
 # now change a particular parameter value by delta w=wr+i*wi
 with torch.no_grad():
     vecr_params[0][0][0]=vecr_params[0][0][0]+del_wr
 
-[H_nn2, H_b2]=O_local(nn_interaction,s,ppsi_vec),O_local(b_field,s,ppsi_vec)
+[H_nn2, H_b2]=O_local(nn_interaction,s,real_net),O_local(b_field,s,real_net)
 new_energy=np.sum(np.mean(H_nn2+H_b2,axis=0)) 
 
 # get the numerical derivative/slope
@@ -659,8 +670,8 @@ print('Numerical derivative (real vector): ', dE, '\n derivative from method: ' 
 
 
 # Now for the imaginary comp
-H,mult=18,0.5
-ppsi_vec=vec_init(L,H,mult)
+H,mult=18,0.2
+ppsi_vec=vec_init(L,H)
 veci_params=list(ppsi_vec.imag_comp.parameters())
 
 del_wi=0.01 # delta w imag
@@ -668,17 +679,19 @@ del_wi=0.01 # delta w imag
 [H_nn, H_b]=O_local(nn_interaction,s,ppsi_vec),O_local(b_field,s,ppsi_vec)
 energy=np.sum(np.mean(H_nn+H_b,axis=0)) 
 
+imag_net=copy.deepcopy(ppsi_vec)
+
 [p1_r,p1_i]=ppsi_vec.apply_energy_gradient(torch.tensor(s,dtype=torch.float) \
                         ,np.sum(H_nn+H_b,axis=1),energy,0.03)
 
-ppsi_vec=vec_init(L,H,mult)
-veci_params=list(ppsi_vec.imag_comp.parameters())
+#imag_net=vec_init(L,H,mult)
+veci_params=list(imag_net.imag_comp.parameters())
 
 # now change a particular parameter value by delta w=wr+i*wi
 with torch.no_grad():
     veci_params[0][0][0]=veci_params[0][0][0]+del_wi
 
-[H_nn2, H_b2]=O_local(nn_interaction,s,ppsi_vec),O_local(b_field,s,ppsi_vec)
+[H_nn2, H_b2]=O_local(nn_interaction,s,imag_net),O_local(b_field,s,imag_net)
 new_energy=np.sum(np.mean(H_nn2+H_b2,axis=0)) 
 
 # get the numerical derivative/slope
@@ -690,8 +703,8 @@ print('Numerical derivative (imag vector): ', dE, '\n derivative from method: ' 
 
 
 # With the magnitude version
-H,mult=16,0.9
-ppsi_mod=mod_init(L,H,mult)
+H,mult=18,0.3
+ppsi_mod=mod_init(L,H)
 modr_params=list(ppsi_mod.real_comp.parameters())
 
 del_wr=0.01 
@@ -700,23 +713,18 @@ del_wr=0.01
 energy=np.sum(np.mean(H_nn+H_b,axis=0)) 
 E_loc=np.sum(H_nn+H_b,axis=1)
 
+magn_net=copy.deepcopy(ppsi_mod)
+
 [p1_r,p1_i]=ppsi_mod.apply_energy_gradient(torch.tensor(s,dtype=torch.float) \
                         ,E_loc,energy,0.03)
-#ppsi_mod.real_comp.zero_grad()
-#out=ppsi_mod.real_comp(torch.tensor(s,dtype=torch.float)).flatten()
-#multiplier = 2*np.real((E_loc-energy)/(out.detach().numpy()))   
-#out.backward(torch.tensor((1/N_samples)*multiplier)*out)           
-#
-#params=list(ppsi_mod.real_comp.parameters()) # get the parameters 
-#p1_r=params[0].grad
 
-ppsi_mod=mod_init(L,H,mult)
-modr_params=list(ppsi_mod.real_comp.parameters())
+#magn_net=mod_init(L,H,mult)
+modr_params=list(magn_net.real_comp.parameters())
 
 with torch.no_grad():
     modr_params[0][0][0]=modr_params[0][0][0]+del_wr
 
-[H_nn2, H_b2]=O_local(nn_interaction,s,ppsi_mod),O_local(b_field,s,ppsi_mod)
+[H_nn2, H_b2]=O_local(nn_interaction,s,magn_net),O_local(b_field,s,magn_net)
 new_energy=np.sum(np.mean(H_nn2+H_b2,axis=0)) 
 
 dE=(new_energy-energy)/del_wr
@@ -728,8 +736,10 @@ print('Numerical derivative (real mod): ', dE, '\n derivative from method: ' \
 # ppsi_mod.real_comp(torch.tensor(s,dtype=torch.float))
 
 # Now the angle
-H,mult=18,0.9
-ppsi_mod=mod_init(L,H,mult)
+#H,mult=18,0.9
+H=18
+mult=0.9
+ppsi_mod=mod_init(L,H)
 modi_params=list(ppsi_mod.imag_comp.parameters())
 
 del_wi=0.01 
@@ -737,6 +747,8 @@ del_wi=0.01
 [H_nn, H_b]=O_local(nn_interaction,s,ppsi_mod),O_local(b_field,s,ppsi_mod)
 energy=np.sum(np.mean(H_nn+H_b,axis=0)) 
 E_loc=np.sum(H_nn+H_b,axis=1)
+
+angle_net=copy.deepcopy(ppsi_mod)
 
 [p1_r,p1_i]=ppsi_mod.apply_energy_gradient(torch.tensor(s,dtype=torch.float) \
                         ,E_loc,energy,0.03)
@@ -749,13 +761,13 @@ E_loc=np.sum(H_nn+H_b,axis=1)
 #params=list(ppsi_mod.imag_comp.parameters()) # get the parameters 
 #p1_i=params[0].grad
 
-ppsi_mod=mod_init(L,H,mult)
-modi_params=list(ppsi_mod.imag_comp.parameters())
+#angle_net=mod_init(L,H,mult)
+modi_params=list(angle_net.imag_comp.parameters())
 
 with torch.no_grad():
     modi_params[0][0][0]=modi_params[0][0][0]+del_wi
 
-[H_nn2, H_b2]=O_local(nn_interaction,s,ppsi_mod),O_local(b_field,s,ppsi_mod)
+[H_nn2, H_b2]=O_local(nn_interaction,s,angle_net),O_local(b_field,s,angle_net)
 new_energy=np.sum(np.mean(H_nn2+H_b2,axis=0)) 
 
 dE=(new_energy-energy)/del_wi
@@ -936,71 +948,3 @@ of samples.
 
 # actually, I shouldn't need normalization if it's <psi|H|psi>/<psi|psi>
 
-
-
-#    def apply_energy_gradient(self,s,E_loc,E, lr=0.03): # add Pytorch optimizer) (fixed lr for now)
-#        
-#        N_samples=s.size(0)
-#        out = self.real_comp(s).flatten()
-#        
-#        # should be the simpler form to apply dln(Psi)/dw_i
-#        if self.form.lower()=='euler':
-#            # each form has a slightly different multiplication form
-#            with torch.no_grad():
-#                multiplier = 2*np.real((E_loc-E)/(out.detach().numpy()))   
-#                #multiplier = 2*np.real(E_loc)
-#        elif self.form.lower()=='vector':
-#            if np.all(self.complex==0):
-#                self.complex_out(self,s) # define self.complex
-#            
-#            with torch.no_grad():
-#                multiplier = 2*np.real((E_loc-E)/self.complex.flatten())
-#                #multiplier = 2*np.real(E_loc)
-#                
-#        self.real_comp.zero_grad()
-#        out.backward(torch.tensor((1/N_samples)*multiplier)*out)
-#        # calling this applies autograd to only tensor .grad object i.e. out
-#        # which corresponds to dpsi_real(s)/dpars. 
-#        # must include the averaging over # samples factor myself 
-#        
-#        params=list(self.real_comp.parameters()) # get the parameters
-#        
-#        # for testing purposes
-#        pr1_grad=params[0].grad
-#        
-#        with torch.no_grad():
-#            for param in params:
-#                param -= lr*param.grad # apply the Energy gradient descent
-#        
-#        ## Now do the same for the imaginary network. note, they are not done 
-#        # in parallel here as the networks and number of parameters therein can 
-#        # vary arbitrarily, so the for loop has to be over each ANN separately
-#        # this way is also less memory intensive as out, mult, etc. are overwritten
-#        out = self.imag_comp(s).flatten()
-#
-#        # complex versions of the multiplier 
-#        if self.form.lower()=='euler':
-#            #multiplier = 2*np.imag(E_loc)
-#            multiplier = 2*np.real((E_loc-E)*1j)
-#            # 2*np.real((E_loc-E)*1j) or 2*np.imag(-E_loc), but gettin sign err
-#            # note, to accelerate, Energy E could not appear here because it 
-#            # should be real. Where it is not are sampling/accuracy errors
-#            
-#        elif self.form.lower()=='vector':
-#            # self.complex should have been defined in previous section of method
-#            with torch.no_grad():
-#                multiplier = 2*np.real(1j*(E_loc-E)/self.complex.flatten())
-#                #multiplier = 2*np.imag(E_loc)
-#                
-#        self.imag_comp.zero_grad()
-#        out.backward(torch.tensor((1/N_samples)*multiplier)*out)
-#        
-#        params=list(self.imag_comp.parameters()) # get the parameters
-#        
-#        pi1_grad=params[0].grad
-#        
-#        with torch.no_grad():
-#            for param in params:
-#                param -= lr*param.grad
-#            
-#        return pr1_grad, pi1_grad
