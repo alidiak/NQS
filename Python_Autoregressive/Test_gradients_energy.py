@@ -119,10 +119,10 @@ E0=np.mean(E_loc)
 outr=ppsi_mod.real_comp(s)
 
 #mult=torch.tensor(2*np.real(E_loc-E0))
-mult=torch.tensor((2*np.real(E_loc-E0)/(outr.detach().numpy()).T).T)
+mult=torch.tensor((2*np.real(E_loc-E0)))#/(outr.detach().numpy()).T).T)
 
 # what we calculated the gradients should be
-(outr*mult).mean().backward()
+(outr.log()*mult[:,None]).mean().backward()
 
 pars=list(ppsi_mod.real_comp.parameters())
 grad0=pars[0].grad 
