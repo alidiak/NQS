@@ -61,13 +61,17 @@ def psi_init(L, H=2*L, Form='euler'):
     return ppsi
 
 ''' ########## Expand the O_omega routines to calculate grad of E ##########'''
-N_samples=20
-s=np.random.randint(-1,high=1,size=[N_samples,L]); s[s==0]=1; sn=s.copy();
-s=torch.tensor(s,dtype=torch.float); 
+
+''' ## ANGLE ## '''
+N_samples=100
+
 L=3
 H=2*L
-
 ppsi_mod=psi_init(L,H,'euler') # without mult, initializes params randomly
+
+## HAVE TO GENERATE THE SAMPLES VIA MONTE CARLO! Otherwise may not be wieghted correctly ##
+sn=ppsi_mod.sample_MH(N_samples,spin=0.5)
+s=torch.tensor(sn,dtype=torch.float)
 modi_params=list(ppsi_mod.imag_comp.parameters())
 
 [H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_mod),O_local(b_field,s.numpy(),ppsi_mod)
@@ -95,10 +99,13 @@ for ii in range(N_samples):
 print('Pytorch derivative" ', grad0, '\n vs analytical derivative (only works when) '\
       'when using single layer affine map: ', analytic)
 
-dw=0.001 # sometimes less accurate when smaller than 1e-3
+dw=0.01 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
     modi_params[0][0][0]=modi_params[0][0][0]+dw
  
+#sn=ppsi_mod.sample_MH(N_samples,spin=0.5)
+#s=torch.tensor(sn,dtype=torch.float)
+    
 # recalculate the energy
 [H_nn2, H_b2]=O_local(nn_interaction,s.numpy(),angle_net),O_local(b_field,s.numpy(),angle_net)
 new_energy=np.sum(np.mean(H_nn2+H_b2,axis=0)) 
@@ -110,16 +117,21 @@ print('numberical deriv: ', deriv, '\n pytorch deriv: ', grad0[0][0].item(), \
       '\n ratio : ' , deriv.item()/grad0[0][0].item() ,\
         '\n relative error: ', np.abs((grad0[0][0].item()-deriv)/deriv) )
 
-ppsi_mod=psi_init(L,H,'euler') # without mult, initializes params randomly
+''' ## MODULUS ## '''
 
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_mod),O_local(b_field,s.numpy(),ppsi_mod)
-E_loc=np.conj(np.sum(H_nn+H_b,axis=1))
-E0=np.mean(E_loc)
+ppsi_mod=psi_init(L,H,'euler') # without mult, initializes params randomly
+mod_net=copy.deepcopy(ppsi_mod)
+sn=ppsi_mod.sample_MH(N_samples,spin=0.5)
+s=torch.tensor(sn,dtype=torch.float)
+
+[H_nn, H_b]=O_local(nn_interaction,sn,ppsi_mod),O_local(b_field,sn,ppsi_mod)
+E_loc=np.sum(H_nn+H_b,axis=1)
+E0=np.real(np.mean(E_loc))
 
 outr=ppsi_mod.real_comp(s)
 
 #mult=torch.tensor(2*np.real(E_loc-E0))
-mult=torch.tensor((2*np.real(E_loc-E0)))#/(outr.detach().numpy()).T).T)
+mult=torch.tensor((2*np.real(np.conj(E_loc)-np.conj(E0))))#/(outr.detach().numpy()).T).T)
 
 # what we calculated the gradients should be
 (outr.log()*mult[:,None]).mean().backward()
@@ -127,43 +139,50 @@ mult=torch.tensor((2*np.real(E_loc-E0)))#/(outr.detach().numpy()).T).T)
 pars=list(ppsi_mod.real_comp.parameters())
 grad0=pars[0].grad 
 
-# This is the analytical term for the derivative of a single layer affine map (matches)
-#analytic=0.5*(2*np.real((E_loc[0]-E0)*(sn[0]/outr[0].item()))+2*np.real((\
-#              E_loc[1]-E0)*(sn[1]/outr[1].item())))
 analytic=0
 for ii in range(N_samples):
-    analytic=analytic+2*np.real((E_loc[ii]-E0)*(sn[ii]/outr[ii].item()))/N_samples
-print('Pytorch derivative" ', grad0, '\n vs analytical derivative (only works when) '\
+    analytic=analytic+2*np.real((np.conj(E_loc[ii])-np.conj(E0)) \
+                                *(sn[ii]/outr[ii].item()))/N_samples
+print('Pytorch derivative ', grad0, '\n vs analytical derivative (only works when) '\
       'when using single layer affine map: ', analytic)
 
-dw=0.01 # sometimes less accurate when smaller than 1e-3
+pars2=list(mod_net.real_comp.parameters())
+dw=0.001 # sometimes less accurate when smaller than 1e-3
+#for ii in range(pars2[0].size(1)):
 with torch.no_grad():
-    pars[0][0][0]=pars[0][0][0]+dw
+    pars2[0][0][0]=pars2[0][0][0]+dw
+#    pars2[1][0]=pars2[1][0]+dw
  
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_mod),O_local(b_field,s.numpy(),ppsi_mod)
+# MUST RESAMPLE WITH THE CHANGED PSI (but this messes up the comparison!)
+#sn=mod_net.sample_MH(N_samples,spin=0.5)
+#s=torch.tensor(sn,dtype=torch.float)
+
+[H_nn, H_b]=O_local(nn_interaction,s.numpy(),mod_net),O_local(b_field,s.numpy(),mod_net)
 E_loc=np.sum(H_nn+H_b,axis=1)
 E1=np.real(np.mean(E_loc))
-#deriv_r=(E1-E0)/dw
-deriv_r=(E1-E0)/dw
+deriv_r=np.real((E1-E0)/dw)
 
 print('numberical deriv: ', deriv_r.item(), '\n pytorch deriv: ', grad0[0][0].item(), \
         '\n ratio: ', deriv_r.item()/grad0[0][0].item() )
 
 ''' Now with vector version '''
 
-N_samples=100
-s=np.random.randint(-1,high=1,size=[N_samples,L]); s[s==0]=1; 
-s=torch.tensor(s,dtype=torch.float)
+''' ## REAL COMP ## '''
+
+N_samples=1000
 L=3
 H=2*L
 
 ppsi_vec=psi_init(L,H,'vector')  # without mult, initializes params randomly
 
+sn=ppsi_vec.sample_MH(N_samples,spin=0.5)
+s=torch.tensor(sn,dtype=torch.float)
+
 psi0=ppsi_vec.complex_out(s)
 
 [H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_vec),O_local(b_field,s.numpy(),ppsi_vec)
 E_loc=np.sum(H_nn+H_b,axis=1)
-E0=np.real(np.mean(E_loc))
+E0=np.mean(E_loc)
 
 outr=ppsi_vec.real_comp(s)
 
@@ -204,6 +223,14 @@ for kk in range(len(pars)):
     pars[kk].grad=grad_list[kk]
 
 grad0=grad_list[0]
+
+analytic=0
+for ii in range(N_samples):
+    analytic=analytic+2*np.real((np.conj(E_loc[ii])-np.conj(E0)) \
+                    *(sn[ii]/psi0[ii].item()))/N_samples
+print('Pytorch derivative ', grad0, '\n vs analytical derivative (only works when) '\
+      'when using single layer affine map: ', analytic)
+
 dw=0.01 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
     pars[0][0][0]=pars[0][0][0]+dw
@@ -217,8 +244,12 @@ deriv=(E1-E0)/dw
 print('numberical deriv: ', deriv, '\n pytorch deriv: ', grad0[0][0].item() , \
         '\n ratio: ', deriv/grad0[0][0].item() )
 
+''' ## IMAG COMP ## '''
 # finally for complex vec i
 ppsi_vec=psi_init(L,H,'vector') # without mult, initializes params randomly
+
+sn=ppsi_vec.sample_MH(N_samples,spin=0.5)
+s=torch.tensor(sn,dtype=torch.float)
 
 psi0=ppsi_vec.complex_out(s) # the original psi
 
@@ -251,6 +282,14 @@ for kk in range(len(pars)):
     par_list[kk]=par_list[kk]/N_samples
 
 grad0=par_list[0]
+
+analytic=0
+for ii in range(N_samples):
+    analytic=analytic+2*np.real(1j*(np.conj(E_loc[ii])-np.conj(E0)) \
+                    *(sn[ii]/psi0[ii].item()))/N_samples
+print('Pytorch derivative ', grad0, '\n vs analytical derivative (only works when) '\
+      'when using single layer affine map: ', analytic)
+
 dw=0.01 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
     pars[0][0][0]=pars[0][0][0]+dw
