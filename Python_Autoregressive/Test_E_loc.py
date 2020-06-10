@@ -9,9 +9,8 @@ Created on Tue May 12 14:42:29 2020
 import torch
 import torch.nn as nn
 import numpy as np
-from NQS_pytorch import Op, O_local, Psi
+from NQS_pytorch import Op, O_local, Psi, kron_matrix_gen
 import itertools
-
 
 '''
 entry method inspired by NetKet-1.0.0
@@ -20,7 +19,8 @@ entry method inspired by NetKet-1.0.0
 # system parameters
 b=0.5   # b-field strength
 J=1     # nearest neighbor interaction strength
-L = 3   # system size
+L = 14  # system size
+# L=14 uses about 8Gb of system memory, so it's a suggested max if running many other programs
 
 # Define operators to use in the Hamiltonian
 sigmax = np.array([[0, 1], [1, 0]])
@@ -61,16 +61,16 @@ s=np.array(list(itertools.product(evals,repeat=L))) # each spin permutation
 
 wvf=ppsi.complex_out(torch.tensor(s,dtype=torch.float))
 
-Sb1=np.kron(np.kron(sigmax,np.eye(2)),np.eye(2))
-Sb2=np.kron(np.kron(np.eye(2),sigmax),np.eye(2))
-Sb3=np.kron(np.kron(np.eye(2),np.eye(2)),sigmax)
+# make the list of operators that act on neighbors
+op_list=[]
+for ii in range(2):
+    op_list.append(sigmaz)
+H_szsz=-J*kron_matrix_gen(op_list,len(evals),L,'periodic').toarray()
 
-S1=np.kron(np.kron(sigmaz,sigmaz),np.eye(2))
-S2=np.kron(np.kron(np.eye(2),sigmaz),sigmaz)
-S3=np.kron(np.kron(sigmaz,np.eye(2)),sigmaz)
+op_list2=[]
+op_list2.append(sigmax)
+H_sx=b*kron_matrix_gen(op_list2,len(evals),L,'periodic').toarray()
 
-H_sx=b*(Sb1+Sb2+Sb3)
-H_szsz=-J*(S1+S2+S3)
 # H_szsz=-J*(np.diag([3,-1,-1,-1,-1,-1,-1,3])) # from my ED Matlab code
 H_tot=H_szsz+H_sx
 
@@ -78,7 +78,7 @@ E_sx=np.matmul(np.matmul(np.conjugate(wvf.T),H_sx),wvf)/(np.matmul(np.conjugate(
 E_szsz=np.matmul(np.matmul(np.conjugate(wvf.T),H_szsz),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
 E_tot=np.matmul(np.matmul(np.conjugate(wvf.T),H_tot),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
 
-N_samples=1000
+N_samples=10000
 sn=ppsi.sample_MH(N_samples,spin=0.5)
 H_nn=O_local(nn_interaction,sn,ppsi)
 H_b=O_local(b_field,sn,ppsi)
@@ -88,28 +88,28 @@ print('For psi= \n', wvf, '\n\n the energy (using exact H) is: ', E_tot, '\n whi
       '\n\n for the exact Sx H: ', E_sx, ' vs ',np.sum(np.mean(H_b,axis=0)), \
       '\n\n for exact SzSz H: ', E_szsz ,' vs ', np.sum(np.mean(H_nn,axis=0)))
 
-print('\n\n also compare the predicted energy per sample of -sz*sz to the spins: '\
-      'O_local sz*sz energy: \n', H_nn , '\n\n spins: \n', s )
+#print('\n\n also compare the predicted energy per sample of -sz*sz to the spins: '\
+#      'O_local sz*sz energy: \n', H_nn , '\n\n spins: \n', s )
 
 #O_l=np.matmul(np.matmul(np.conjugate(wvf.T),Sx),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
 
 ''' Also checking with SxSx '''
 sxsx=Op(np.kron(sigmax, sigmax))
 
-L = 3
 for i in range(L):  # Specify the sites upon which the operators act
     sxsx.add_site([i,(i+1)%L])
 
 H_sxsx=O_local(sxsx,sn,ppsi)
 
-S1=np.kron(np.kron(sigmax,sigmax),np.eye(2))
-S2=np.kron(np.kron(np.eye(2),sigmax),sigmax)
-S3=np.kron(np.kron(sigmax,np.eye(2)),sigmax)
+op_list=[]
+for ii in range(2):
+    op_list.append(sigmax)
+H_sxsx2=kron_matrix_gen(op_list,len(evals),L,'periodic').toarray()
 
-H_exact= S1+S2+S3+H_sx
+H_exact= H_sxsx2+H_sx
 E_exact=np.matmul(np.matmul(np.conjugate(wvf.T),H_exact),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
 
-print('the energy of Sx*Sx (using exact H) is: ', E_exact, '\n with O_l it is: ' \
+print('\n\n the energy of Sx*Sx (using exact H) is: ', E_exact, '\n with O_l it is: ' \
       ,np.sum(np.mean(H_sxsx+H_b,axis=0)) )
 
 '''                 '''

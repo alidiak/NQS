@@ -204,8 +204,8 @@ class Psi:
             # Will have to generalize to complex vals sometime
             
             # Probabilty of the next state divided by the current
-            prob = (np.square(np.abs(self.complex_out(torch.tensor(alt_state,dtype=torch.float32)))))   \
-            /(np.square(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=torch.float32)))))
+            prob = (np.square(np.abs(self.complex_out(torch.tensor(alt_state,dtype=torch.float)))))   \
+            /(np.square(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=torch.float)))))
             
             A = min(1,prob) # Metropolis Hastings acceptance formula
 
@@ -330,3 +330,52 @@ def O_local(operator,s, psi): # potential improvement to use all tensor funcs so
             # its respective local spin configuration state
                 
     return O_loc
+
+
+def kron_matrix_gen(op_list,D,N,bc):
+    ''' this function generates a Hamiltonian when it consists of a sum
+ of local operators. The local operator should be input at op and the 
+ lattice size of the system should be input as N. The
+ op can also be entered as the kron product of the two operator 
+ matrices or even three with an identity mat in-between for next 
+ nearest-neighbor interactions. D is the local Hilbert space size.  '''
+    
+    import scipy.sparse as sp
+    import numpy as np
+    
+    # extract/convert the operator list to a large operator
+    op=op_list[0]
+    for ii in range(1,len(op_list)):
+        op=np.kron(op,op_list[ii])
+    
+    sop=sp.coo_matrix(op,dtype=np.float32) # make sparse
+    
+    matrix=sp.coo_matrix((D**N,D**N),dtype=np.float32) # all 0 sparse 
+    
+    nops=int(round(np.log(len(op))/np.log(D)) )
+    #number of sites the entered op is acting on
+    
+    bc_term=(nops-1)
+    
+    for j in range(N-bc_term):
+        a=sp.kron(sp.eye(D**j),sop)
+        b= sp.kron(a,sp.eye(D**(N-j-nops)))
+        matrix=matrix+b
+    
+    if bc=='periodic':
+        for kk in range(nops-1):
+            end_ops=op_list[-1]
+            for ii in range(kk):
+                end_ops=sp.kron(op_list[-ii-2],end_ops)
+            
+            begin_ops=op_list[0]
+            for ii in range(nops-2-kk):
+                begin_ops=sp.kron(begin_ops,op_list[ii+1])
+            
+            a=sp.kron(end_ops,sp.eye(D**(N-nops)))
+            b=sp.kron(a,begin_ops)
+            matrix=matrix+b
+            
+    return matrix
+
+
