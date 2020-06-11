@@ -16,7 +16,7 @@ import itertools
 # system parameters
 b=0.5   # b-field strength
 J=1     # nearest neighbor interaction strength
-L = 10   # system size
+L = 6   # system size
 burn_in=1000
 N_samples=10000 # number of samples for the Monte Carlo chains
 
