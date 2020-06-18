@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+Created on Mon Jun 15 14:01:56 2020
+
+@author: alex
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
 Created on Tue May 12 14:43:25 2020
 
 @author: alex
@@ -82,19 +90,29 @@ def psi_init(L, H=2*L, Form='euler'):
 
 ''' ########## Expand the O_omega routines to calculate grad of E ##########'''
 
-''' ## ANGLE ## '''
+# function to apply multipliers to the expectation value O_local expression 
+def Exp_val(mat,wvf):
+    
+    if len(np.shape(mat))==0:
+        O_l= np.sum(mat*np.abs(wvf.T)**2)\
+        /(np.matmul(np.conjugate(wvf.T),wvf))
+    else:
+        O_l= np.sum(np.matmul((np.abs(wvf.T)**2),mat))\
+        /(np.matmul(np.conjugate(wvf.T),wvf))
+    
+    return O_l
+
+''' ######################## ANGLE COMPONENT CALC ##################### '''
 
 H=2*L
 ppsi_mod=psi_init(L,H,'euler') # without mult, initializes params randomly
 
 ## HAVE TO GENERATE THE SAMPLES VIA MONTE CARLO! Otherwise may not be wieghted correctly ##
 sb=ppsi_mod.sample_MH(burn_in,spin=0.5)
-sn=ppsi_mod.sample_MH(N_samples,spin=0.5, s0=sb[-1])
-s=torch.tensor(sn,dtype=torch.float)
+s=torch.tensor(ppsi_mod.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float32)
 modi_params=list(ppsi_mod.imag_comp.parameters())
 
 [H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_mod),O_local(b_field,s.numpy(),ppsi_mod)
-energy=np.sum(np.mean(H_nn+H_b,axis=0)) 
 E_loc=np.sum(H_nn+H_b,axis=1)
 
 angle_net=copy.deepcopy(ppsi_mod)
@@ -111,30 +129,9 @@ modi_params=list(angle_net.imag_comp.parameters())
 pars=list(ppsi_mod.imag_comp.parameters())
 grad0=pars[0].grad 
 
-# This is the analytical term for the derivative of a single layer affine map (matches)
-#analytic=0
-#for ii in range(N_samples):
-#    analytic=analytic+2*np.imag(E_loc[ii]*sn[ii])/N_samples
-#print('Pytorch derivative vs analytical derivative (only works when '\
-# 'when using single layer affine map): \n', analytic, '\n', np.real(grad0),'\n')
-
-dw=0.01 # sometimes less accurate when smaller than 1e-3
+dw=0.001 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
     modi_params[0][0][0]=modi_params[0][0][0]+dw
-
-# uncomment to have burn ins and resampling
-#sb=angle_net.sample_MH(burn_in,spin=0.5)
-#sn=angle_net.sample_MH(N_samples,spin=0.5,s0=sb[-1])
-#s=torch.tensor(sn,dtype=torch.float)
-    
-# recalculate the energy
-[H_nn2, H_b2]=O_local(nn_interaction,s.numpy(),angle_net),O_local(b_field,s.numpy(),angle_net)
-new_energy=np.sum(np.mean(H_nn2+H_b2,axis=0)) 
-deriv=np.real((new_energy-energy)/dw)
-
-print('ANGLE: \n numberical deriv: ', deriv, '\n pytorch deriv: ',  \
-      grad0[0][0].item(), '\n ratio : ' , deriv.item()/grad0[0][0].item() ,\
-        '\n relative error: ', np.abs((grad0[0][0].item()-deriv)/deriv) )
 
 wvf0=ppsi_mod.complex_out(torch.tensor(s2,dtype=torch.float))
 wvf1=angle_net.complex_out(torch.tensor(s2,dtype=torch.float))
@@ -142,26 +139,54 @@ E_tot0=np.matmul(np.matmul(np.conjugate(wvf0.T),H_tot),wvf0)/(np.matmul(np.conju
 E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conjugate(wvf1.T),wvf1))
 dif=(E_tot1-E_tot0)/dw
 
-print('\n DE/dw with matrix and wavefunction difference: ', dif, ' \n pytorch derivative'\
-' relative error with respect to wvf calculated E: ', np.abs(grad0[0][0].item()-dif)/dif,\
-'\n with ratio: ', grad0[0][0].item()/dif, '\n\n')
+print('\n\n #################### Angle ######################### \n',\
+      'Pytorch derivative: ', grad0[0][0].item(),\
+  '\n DE/dw with wavefunction: ', dif, ' \n pytorch derivative'\
+' relative error: ', np.abs(grad0[0][0].item()-dif)/dif,\
+'\n Ratio: ', grad0[0][0].item()/dif, '\n\n')
 
-''' ## MODULUS ## '''
+print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), \
+      '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
+
+# Here calculate the base (unaltered) equivalent expression using O_local 
+[H_nn_ex, H_b_ex]=O_local(nn_interaction,s2,ppsi_mod),O_local(b_field,s2,ppsi_mod)
+E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
+E0 = Exp_val(E_loc,wvf0)
+
+# now, see if the derived alteration to the above expression accounts for the 
+# observed diferential with dw
+# get Ok on a per sample basis
+Ok=np.zeros([np.shape(s2)[0],1],dtype=complex)
+out=ppsi_mod.imag_comp(torch.tensor(s2,dtype=torch.float))
+pars=list(ppsi_mod.imag_comp.parameters())
+for ii in range(np.shape(s2)[0]):
+    ppsi_mod.imag_comp.zero_grad()
+    out[ii].backward(retain_graph=True) 
+
+    Ok[ii]=1j*pars[0].grad[0][0].numpy()
+
+Ok=np.squeeze(Ok)
+
+# now for the full derivate expression using the original wavefunction
+deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
+Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))
+
+print('\n Expecation val deriv: ', deriv_E0, '\n vs numerical wvf energy diff: ', dif)
+
+''' ######################## MODULUS COMPONENT CALC ##################### '''
 
 ppsi_mod=psi_init(L,H,'euler') # without mult, initializes params randomly
 mod_net=copy.deepcopy(ppsi_mod)
 sb=ppsi_mod.sample_MH(burn_in,spin=0.5)
-sn=ppsi_mod.sample_MH(N_samples,spin=0.5, s0=sb[-1])
-s=torch.tensor(sn,dtype=torch.float)
+s=torch.tensor(ppsi_mod.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float32)
 
-[H_nn, H_b]=O_local(nn_interaction,sn,ppsi_mod),O_local(b_field,sn,ppsi_mod)
+[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_mod),O_local(b_field,s.numpy(),ppsi_mod)
 E_loc=np.sum(H_nn+H_b,axis=1)
 E0=np.real(np.mean(E_loc))
 
 outr=ppsi_mod.real_comp(s)
 
-#mult=torch.tensor(2*np.real(E_loc-E0))
-mult=torch.tensor((2*np.real(np.conj(E_loc)-np.conj(E0))))#/(outr.detach().numpy()).T).T)
+mult=torch.tensor((2*np.real(np.conj(E_loc)-np.conj(E0))))
 
 # what we calculated the gradients should be
 (outr.log()*mult[:,None]).mean().backward()
@@ -169,32 +194,10 @@ mult=torch.tensor((2*np.real(np.conj(E_loc)-np.conj(E0))))#/(outr.detach().numpy
 pars=list(ppsi_mod.real_comp.parameters())
 grad0=pars[0].grad 
 
-#analytic=0
-#for ii in range(N_samples):
-#    analytic=analytic+2*np.real((np.conj(E_loc[ii])-np.conj(E0)) \
-#                                *(sn[ii]/outr[ii].item()))/N_samples
-#print('Pytorch derivative vs analytical derivative (only works when '\
-# 'when using single layer affine map): \n', analytic, '\n', np.real(grad0),'\n')
-
 pars2=list(mod_net.real_comp.parameters())
-dw=0.01 # sometimes less accurate when smaller than 1e-3
-#for ii in range(pars2[0].size(1)):
+dw=0.001 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
     pars2[0][0][0]=pars2[0][0][0]+dw
-#    pars2[1][0]=pars2[1][0]+dw
- 
-# MUST RESAMPLE WITH THE CHANGED PSI (but this messes up the comparison!)
-#sb=mod_net.sample_MH(burn_in,spin=0.5)
-#sn=mod_net.sample_MH(N_samples,spin=0.5,s0=sb[-1])
-#s=torch.tensor(sn,dtype=torch.float)
-
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),mod_net),O_local(b_field,s.numpy(),mod_net)
-E_loc=np.sum(H_nn+H_b,axis=1)
-E1=np.real(np.mean(E_loc))
-deriv_r=np.real((E1-E0)/dw)
-
-print('MODULUS: \n numberical deriv: ', deriv_r.item(), '\n pytorch deriv: ', \
-      grad0[0][0].item(), '\n ratio: ', deriv_r.item()/grad0[0][0].item() )
 
 wvf0=ppsi_mod.complex_out(torch.tensor(s2,dtype=torch.float))
 wvf1=mod_net.complex_out(torch.tensor(s2,dtype=torch.float))
@@ -202,20 +205,46 @@ E_tot0=np.matmul(np.matmul(np.conjugate(wvf0.T),H_tot),wvf0)/(np.matmul(np.conju
 E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conjugate(wvf1.T),wvf1))
 dif=(E_tot1-E_tot0)/dw
 
-print('\n DE/dw with matrix and wavefunction difference: ', dif, ' \n pytorch derivative'\
-' relative error with respect to wvf calculated E: ', np.abs(grad0[0][0].item()-dif)/dif,\
-'\n with ratio: ', grad0[0][0].item()/dif, '\n\n')
+print('\n\n #################### Modulus ######################### \n',\
+      'Pytorch derivative: ', grad0[0][0].item(),
+  '\n DE/dw with wavefunction: ', dif, ' \n pytorch derivative'\
+' relative error: ', np.abs(grad0[0][0].item()-dif)/dif,\
+'\n Ratio: ', grad0[0][0].item()/dif, '\n\n')
+
+print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), 
+      '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
+
+# Here calculate the base (unaltered) equivalent expression using O_local 
+[H_nn_ex, H_b_ex]=O_local(nn_interaction,s2,ppsi_mod),O_local(b_field,s2,ppsi_mod)
+E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
+    
+# get Ok on a per sample basis
+Ok=np.zeros([np.shape(s2)[0],1],dtype=complex)
+out=ppsi_mod.real_comp(torch.tensor(s2,dtype=torch.float))
+pars=list(ppsi_mod.real_comp.parameters())
+for ii in range(np.shape(s2)[0]):
+    ppsi_mod.real_comp.zero_grad()
+    out[ii].backward(retain_graph=True) 
+
+    Ok[ii]=pars[0].grad[0][0].numpy()/out[ii].detach().numpy()
+    
+Ok=np.squeeze(Ok)
+
+# now for the full derivate expression using the original wavefunction
+deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
+Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))
+
+print('\n Expecation val deriv: ', deriv_E0, '\n vs numerical wvf energy diff: ', dif)
 
 ''' Now with vector version '''
 
-''' ## REAL COMP ## '''
+''' ######################## REAL COMPONENT CALC ######################### '''
 
 ppsi_vec=psi_init(L,H,'vector')  # without mult, initializes params randomly
 real_net=copy.deepcopy(ppsi_vec)
 
 sb=ppsi_vec.sample_MH(burn_in,spin=0.5)
-sn=ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1])
-s=torch.tensor(sn,dtype=torch.float)
+s=torch.tensor(ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float)
 
 psi0=ppsi_vec.complex_out(s)
 
@@ -243,49 +272,20 @@ for n in range(N_samples):
                                         # and it can be applied again
     m= 2*np.real((np.conj(E_loc[n])-np.conj(E0))/psi0[n])  # 1/Psi(s) multiplier according to derivative
           
-    # way 1
-#    for kk in range(len(pars)):
-#        par_list[kk]+=(pars[kk].grad.detach().numpy())*m
-  
-    # way 2
     m=torch.tensor(m,dtype=torch.float)
     for kk in range(len(pars)):
         with torch.no_grad():
             grad_list[kk]+=(pars[kk].grad)*(m/N_samples)
-#        pars[kk].grad=pars[kk].grad*(m/N_samples)
-    
-# manually do the mean
-#for kk in range(len(pars)):
-#    par_list[kk]=par_list[kk]/N_samples
+
 
 for kk in range(len(pars)):
     pars[kk].grad=grad_list[kk]
 
 grad0=grad_list[0]
 
-#analytic=0
-#for ii in range(N_samples):
-#    analytic=analytic+2*np.real((np.conj(E_loc[ii])-np.conj(E0)) \
-#                    *(sn[ii]/psi0[ii].item()))/N_samples
-#print('Pytorch derivative vs analytical derivative (only works when '\
-# 'when using single layer affine map): \n', analytic, '\n', np.real(grad0),'\n')
-
 dw=0.01 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
     pars[0][0][0]=pars[0][0][0]+dw
- 
-#sb=ppsi_vec.sample_MH(burn_in,spin=0.5)
-#sn=ppsi_vec.sample_MH(N_samples,spin=0.5,s0=sb[-1])
-#s=torch.tensor(sn,dtype=torch.float)
-    
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_vec),O_local(b_field,s.numpy(),ppsi_vec)
-E_loc=np.sum(H_nn+H_b,axis=1)
-E1=np.real(np.mean(E_loc) )
-
-deriv=(E1-E0)/dw
-
-print('REAL COMP: \n numberical deriv: ', deriv, '\n pytorch deriv: ',  \
-        grad0[0][0].item() , '\n ratio: ', deriv/grad0[0][0].item() )
 
 wvf0=real_net.complex_out(torch.tensor(s2,dtype=torch.float))
 wvf1=ppsi_vec.complex_out(torch.tensor(s2,dtype=torch.float))
@@ -293,18 +293,43 @@ E_tot0=np.matmul(np.matmul(np.conjugate(wvf0.T),H_tot),wvf0)/(np.matmul(np.conju
 E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conjugate(wvf1.T),wvf1))
 dif=(E_tot1-E_tot0)/dw
 
-print('\n DE/dw with matrix and wavefunction difference: ', dif, ' \n pytorch derivative'\
-' relative error with respect to wvf calculated E: ', np.abs(grad0[0][0].item()-dif)/dif,\
-'\n with ratio: ', grad0[0][0].item()/dif, '\n\n')
+print('\n\n #################### Real COMP ######################### \n',\
+      'Pytorch derivative: ', grad0[0][0].item(),\
+  '\n DE/dw with wavefunction: ', dif, ' \n pytorch derivative'\
+' relative error: ', np.abs(grad0[0][0].item()-dif)/dif,\
+'\n Ratio: ', grad0[0][0].item()/dif, '\n\n')
 
-''' ## IMAG COMP ## '''
+print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), 
+      '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
+
+# Here calculate the base (unaltered) equivalent expression using O_local 
+[H_nn_ex, H_b_ex]=O_local(nn_interaction,s2,real_net),O_local(b_field,s2,real_net)
+E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
+    
+psi=real_net.complex_out(torch.tensor(s2,dtype=torch.float))
+Ok=np.zeros([np.shape(s2)[0],1],dtype=complex)
+out=real_net.real_comp(torch.tensor(s2,dtype=torch.float))
+pars=list(real_net.real_comp.parameters())
+for ii in range(np.shape(s2)[0]):
+    real_net.real_comp.zero_grad()
+    out[ii].backward(retain_graph=True) 
+
+    Ok[ii]=pars[0].grad[0][0].numpy()/psi[ii]
+    
+Ok=np.squeeze(Ok)
+
+deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
+Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))
+
+print('\n Expecation val deriv: ', deriv_E0, '\n vs numerical wvf energy diff: ', dif)
+
+''' ######################## IMAGINARY COMPONENT CALC ##################### '''
 # finally for complex vec i
 ppsi_vec=psi_init(L,H,'vector') # without mult, initializes params randomly
 imag_net=copy.deepcopy(ppsi_vec)
 
 sb=ppsi_vec.sample_MH(burn_in,spin=0.5)
-sn=ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1])
-s=torch.tensor(sn,dtype=torch.float)
+s=torch.tensor(ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float)
 
 psi0=ppsi_vec.complex_out(s) # the original psi
 
@@ -338,28 +363,9 @@ for kk in range(len(pars)):
 
 grad0=par_list[0]
 
-#analytic=0
-#for ii in range(N_samples):
-#    analytic=analytic+2*np.real(1j*(np.conj(E_loc[ii])-np.conj(E0)) \
-#                    *(sn[ii]/psi0[ii].item()))/N_samples
-#print('Pytorch derivative vs analytical derivative (only works when '\
-# 'when using single layer affine map): \n', analytic, '\n', np.real(grad0),'\n')
-
-dw=0.01 # sometimes less accurate when smaller than 1e-3
+dw=0.001 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
     pars[0][0][0]=pars[0][0][0]+dw
- 
-#sb=ppsi_vec.sample_MH(burn_in,spin=0.5)
-#sn=ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1])
-#s=torch.tensor(sn,dtype=torch.float)
-    
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_vec),O_local(b_field,s.numpy(),ppsi_vec)
-E_loc=np.sum(H_nn+H_b,axis=1)
-E1=np.mean(E_loc) 
-deriv_i=(E1-E0)/dw
-
-print('IMAG COMP: \n numberical deriv: ', deriv_i, '\n pytorch deriv: ',  \
-        grad0[0][0].item() , '\n ratio: ', deriv_i/grad0[0][0].item() )
 
 wvf0=imag_net.complex_out(torch.tensor(s2,dtype=torch.float))
 wvf1=ppsi_vec.complex_out(torch.tensor(s2,dtype=torch.float))
@@ -367,6 +373,32 @@ E_tot0=np.matmul(np.matmul(np.conjugate(wvf0.T),H_tot),wvf0)/(np.matmul(np.conju
 E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conjugate(wvf1.T),wvf1))
 dif=(E_tot1-E_tot0)/dw
 
-print('\n DE/dw with matrix and wavefunction difference: ', dif, ' \n pytorch derivative'\
-' relative error with respect to wvf calculated E: ', np.abs(grad0[0][0].item()-dif)/dif,\
-'\n with ratio: ', grad0[0][0].item()/dif, '\n\n')
+print('\n\n #################### IMAG COMP ######################### \n',\
+   'Pytorch derivative: ', grad0[0][0].item(),\
+  '\n DE/dw with wavefunction: ', dif, ' \n pytorch derivative'\
+' relative error: ', np.abs(grad0[0][0].item()-dif)/dif,\
+'\n Ratio: ', grad0[0][0].item()/dif, '\n\n')
+
+print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), 
+      '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
+
+# Here calculate the base (unaltered) equivalent expression using O_local 
+[H_nn_ex, H_b_ex]=O_local(nn_interaction,s2,imag_net),O_local(b_field,s2,imag_net)
+E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
+    
+psi=imag_net.complex_out(torch.tensor(s2,dtype=torch.float))
+Ok=np.zeros([np.shape(s2)[0],1],dtype=complex)
+out=imag_net.imag_comp(torch.tensor(s2,dtype=torch.float))
+pars=list(imag_net.imag_comp.parameters())
+for ii in range(np.shape(s2)[0]):
+    imag_net.imag_comp.zero_grad()
+    out[ii].backward(retain_graph=True) 
+
+    Ok[ii]=1j*pars[0].grad[0][0].numpy()/psi[ii]
+    
+Ok=np.squeeze(Ok)
+
+deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
+Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))
+
+print('\n Expecation val deriv: ', deriv_E0, '\n vs numerical wvf energy diff: ', dif)
