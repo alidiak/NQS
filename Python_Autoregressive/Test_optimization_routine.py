@@ -6,6 +6,7 @@ Created on Tue May 12 16:26:40 2020
 @author: alex
 """
 
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -37,10 +38,10 @@ for i in range(L):  # Specify the sites upon which the operators act
 H=2*L # hidden layer size
 
 # creates an instance of the Sequential class nn.Sigmoid etc usually in forward section
-real_net=nn.Sequential(nn.Linear(L,H), nn.Sigmoid(), nn.Linear(H,1),nn.Sigmoid()) 
+real_net=nn.Sequential(nn.Linear(L,H), nn.Sigmoid(), nn.Linear(H,1))#,nn.Sigmoid()) 
 
 H2=2*L
-imag_net=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),nn.Linear(H2,1),nn.Sigmoid()) 
+imag_net=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),nn.Linear(H2,1))#,nn.Sigmoid()) 
 
 # Test complex wavefunction object construction with modulus and angle
 #ppsi=Psi(real_net,imag_net, L, form='euler')
@@ -49,9 +50,9 @@ ppsi=Psi(real_net,imag_net, L, form='vector')
 
 '''################## Optimization/Simulation Routine ######################'''
 # Enter simulation hyper parameters
-N_iter=200
-N_samples=1000
-burn_in=200
+N_iter=100
+N_samples=5000
+burn_in=1000
 lr=0.1
 
 # make an initial s
@@ -68,8 +69,15 @@ for n in range(N_iter):
     energy=np.mean(energy_per_sample)
     energy_n[n]=np.real(energy)
 
+    start = time.time()
     # apply the energy gradient, updates pars in Psi object
-    ppsi.apply_energy_gradient(s,energy_per_sample,energy,lr)
+#    ppsi.energy_gradient(s,energy_per_sample,energy) # simple gradient descent
+    ppsi.SR(s,energy_per_sample) #lambduh=1)
+    end = time.time()
+    print(end - start)
+    # Euler SGD is many orders of magnitude faster! Not iterative like vector or SR.
+    
+    ppsi.apply_grad(lr) # releases/updates parameters based on grad method (stored in pars.grad)
 
     # before doing the actual sampling, we should do a burn in
     sburn=ppsi.sample_MH(burn_in,spin=0.5)

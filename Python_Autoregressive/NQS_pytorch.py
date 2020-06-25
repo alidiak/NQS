@@ -68,7 +68,10 @@ class Psi:
     a given form of Psi. It does simple gradient descent (no SR or anything).
     It does so given an E_local, Energy E, and wavefunc Psi over sample set s.'''
 
-    def apply_energy_gradient(self,s,E_loc,E, lr=0.03): # add Pytorch optimizer) (fixed lr for now)
+    def energy_gradient(self,s,E_loc,E=None): # add Pytorch optimizer) (fixed lr for now)
+        
+        if E is None:
+            E=np.mean(E_loc)
         
         outr = self.real_comp(s).flatten()
         outi = self.imag_comp(s).flatten()
@@ -94,8 +97,10 @@ class Psi:
             (multiplier*outi).mean().backward()
             
         elif self.form.lower()=='vector':
-            if np.all(self.complex==0):
-                self.complex_out(self,s) # define self.complex
+            if np.all(self.complex==0): 
+        # could create errors if doesn't use the updated ppsi and new s
+        # but each call of O_local redefines the .complex
+                self.complex_out(s) # define self.complex
             
             N_samples=s.size(0)
             
@@ -140,31 +145,157 @@ class Psi:
                 p_r[kk].grad=grad_list_r[kk]
             for kk in range(len(p_i)):
                 p_i[kk].grad=grad_list_i[kk]            
-                
-        params=list(self.real_comp.parameters()) # get the parameters
-        
+                        
         # for testing purposes
-        pr1_grad=params[0].grad
-        
-        with torch.no_grad():
-            for param in params:
-                param -= lr*param.grad # apply the Energy gradient descent
-    
-        ## Now do the same for the imaginary network. note, they are not done 
-        # in parallel here as the networks and number of parameters therein can 
-        # vary arbitrarily, so the for loop has to be over each ANN separately.
-        # Could also make this way less memory intensive as out, mult, etc. 
-        # can easily be overwritten for the angle/magnitude network
-                
-        params=list(self.imag_comp.parameters()) # get the parameters
-        
-        pi1_grad=params[0].grad
-        
-        with torch.no_grad():
-            for param in params:
-                param -= lr*param.grad
+#        pr1_grad=params[0].grad
+#        pi1_grad=params[0].grad
             
-        return pr1_grad, pi1_grad
+        return # pr1_grad, pi1_grad
+
+    def SR(self,s,E_loc, lambduh=1):
+               
+        E0=np.real(np.mean(E_loc))
+        N_samples=s.size(0)
+        
+        outr=self.real_comp(s)
+        outi=self.imag_comp(s)
+        
+        if self.form=='vector':
+            if np.all(self.complex==0):
+                self.complex_out(s)
+        
+        p_r=list(self.real_comp.parameters())
+        p_i=list(self.imag_comp.parameters())
+        
+        grad_list_i=copy.deepcopy(p_i)
+        with torch.no_grad():
+        
+            for param in grad_list_i:
+                param.copy_(torch.zeros_like(param))
+                param.requires_grad=False
+        # have to make a copy to record the gradient variable Ok and the force DE
+        Ok_list_r=[]
+        Ok_list_i=[]
+        with torch.no_grad():
+            grad_list_r=copy.deepcopy(p_r)
+            for ii in range(len(p_r)):
+                grad_list_r[ii].copy_(torch.zeros_like(p_r[ii]))
+                grad_list_r[ii].requires_grad=False
+                if len(p_r[ii].size())==1:
+                    sz1,sz2=p_r[ii].size(0),1    
+                else:
+                    sz1,sz2=p_r[ii].size()
+                Ok_list_r.append(np.zeros([N_samples,sz1,sz2],dtype=complex))
+                
+            grad_list_i=copy.deepcopy(p_i)
+            for ii in range(len(p_i)):
+                grad_list_i[ii].copy_(torch.zeros_like(p_i[ii]))
+                grad_list_i[ii].requires_grad=False
+                if len(p_i[ii].size())==1:
+                    sz1,sz2=p_i[ii].size(0),1    
+                else:
+                    sz1,sz2=p_i[ii].size()
+                Ok_list_i.append(np.zeros([N_samples,sz1,sz2],dtype=complex))
+                
+        # what we calculated the gradients should be
+        for n in range(N_samples):
+            
+            self.real_comp.zero_grad()
+            self.imag_comp.zero_grad()
+        
+            outr[n].backward(retain_graph=True) # retain so that buffers aren't cleared 
+            outi[n].backward(retain_graph=True)     # and it can be applied again
+            
+            # get the multipliers (Ok=dpsi*m) and the energy gradients for each term
+            if self.form=='vector':
+                m_r=(1/self.complex[n])
+                m_i=1j*m_r
+            else:
+                m_r=1/outr[n].detach().numpy()
+                m_i=1j
+            
+            # term for the force
+            E_arg=(np.conj(E_loc[n])-np.conj(E0))
+                  
+            for kk in range(len(p_r)):
+                with torch.no_grad():
+                    grad_list_r[kk]+=(p_r[kk].grad)*torch.tensor(\
+                    (2*np.real(E_arg*m_r)/N_samples),dtype=torch.float)
+                    Ok=p_r[kk].grad.numpy()*m_r
+                    # to deal with 1-dim params
+                    if len(np.shape(Ok))==1:
+                        Ok=Ok[:,None]
+        #            E_Ok=np.mean(Ok,1)[:,None]
+        #            S=2*np.real(np.matmul(np.conj(Ok),Ok.T)-\
+        #                        np.matmul(np.conj(E_Ok),E_Ok.T))
+                    Ok_list_r[kk][n]=Ok
+        
+            for kk in range(len(p_i)):
+                with torch.no_grad():
+                    grad_list_i[kk]+=(p_i[kk].grad)*torch.tensor(\
+                    (2*np.real(E_arg*m_i)/N_samples),dtype=torch.float)
+                    Ok=p_i[kk].grad.numpy()*m_i
+                    if len(np.shape(Ok))==1:
+                        Ok=Ok[:,None]
+                    Ok_list_i[kk][n]=Ok
+        # unfortunately, must record Ok for each sample so an expectation <Ok> can be taken
+        # This could be a memory/speed issue, but I don't see an obvious route around it
+                    
+        S_list_r=[]
+        for kk in range(len(Ok_list_r)):
+            Exp_Ok=np.mean(Ok_list_r[kk],0)  # conj(mean)=mean(conj)
+        #    T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
+            T1=np.einsum('kni,imk->nm',np.conj(Ok_list_r[kk]),Ok_list_r[kk].T)/N_samples
+            # These are methods are equivalent! Good sanity check
+            St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+            l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
+            S_list_r.append(St+l_reg) 
+        
+        S_list_i=[]
+        for kk in range(len(Ok_list_i)):
+            Exp_Ok=np.mean(Ok_list_i[kk],0) 
+            T1=np.einsum('kni,imk->nm',np.conj(Ok_list_i[kk]),Ok_list_i[kk].T)/N_samples
+            St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+            l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
+            S_list_i.append(St+l_reg) 
+        
+        for kk in range(len(p_r)):
+            S_inv=torch.tensor(np.linalg.pinv(S_list_r[kk]),dtype=torch.float) # have to inverse S
+            if len(grad_list_r[kk].size())==1: # deal with .mm issues when vector Mx1        
+                p_r[kk].grad=(torch.mm(S_inv,grad_list_r[kk][:,None]))\
+                .view(p_r[kk].size()).detach()
+            else:
+                p_r[kk].grad=torch.mm(S_inv,grad_list_r[kk])
+        
+        for kk in range(len(p_i)):
+            S_inv=torch.tensor(np.linalg.pinv(S_list_i[kk]),dtype=torch.float) # have to inverse S
+            if len(grad_list_i[kk].size())==1: # deal with .mm issues when vector Mx1        
+                p_i[kk].grad=(torch.mm(S_inv,grad_list_i[kk][:,None]))\
+                .view(p_i[kk].size()).detach()
+            else:
+                p_i[kk].grad=torch.mm(S_inv,grad_list_i[kk])
+            
+        return 
+
+    def apply_grad(self, lr=0.03):
+        
+        params_r=list(self.real_comp.parameters()) # get the parameters
+        params_i=list(self.imag_comp.parameters())    
+        
+        # apply the Energy gradient descent
+        if len(params_r)==len(params_i):
+            with torch.no_grad():
+                for ii in range(len(params_r)):
+                    params_r[ii] -= lr*params_r[ii].grad 
+                    params_i[ii] -= lr*params_i[ii].grad
+        else:
+            with torch.no_grad():
+                for param in params_r:
+                    param -= lr*param.grad
+                for param in params_i:
+                    param -= lr*param.grad
+        
+        return
 
     '''###################### Sampling function ################################'''
     def sample_MH(self, N_samples, spin=None, evals=None, s0=None, rot=None):
