@@ -16,7 +16,7 @@ from NQS_pytorch import Psi, Op, O_local
 # system parameters
 b=0.5   # b-field strength
 J=1     # nearest neighbor interaction strength
-L = 3   # system size
+L = 6   # system size
 
 # Define operators to use in the Hamiltonian
 sigmax = np.array([[0, 1], [1, 0]])
@@ -34,6 +34,8 @@ for i in range(L):  # Specify the sites upon which the operators act
     b_field.add_site([i])
     nn_interaction.add_site([i,(i+1)%L])
 
+
+
 '''##### Define Neural Networks and the form for Psi (euler or vector) #####'''
 H=2*L # hidden layer size
 
@@ -44,14 +46,14 @@ H2=2*L
 imag_net=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),nn.Linear(H2,1))#,nn.Sigmoid()) 
 
 # Test complex wavefunction object construction with modulus and angle
-#ppsi=Psi(real_net,imag_net, L, form='euler')
+ppsi=Psi(real_net,imag_net, L, form='euler')
 # OR
-ppsi=Psi(real_net,imag_net, L, form='vector')
+#ppsi=Psi(real_net,imag_net, L, form='vector')
 
 '''################## Optimization/Simulation Routine ######################'''
 # Enter simulation hyper parameters
-N_iter=100
-N_samples=5000
+N_iter=300
+N_samples=10000
 burn_in=1000
 lr=0.1
 

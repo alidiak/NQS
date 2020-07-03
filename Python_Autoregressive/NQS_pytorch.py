@@ -13,6 +13,7 @@ import itertools
 import numpy as np
 import torch
 import copy
+import autograd_hacks
 
 class Op:
     
@@ -23,7 +24,7 @@ class Op:
     def add_site(self,new_site):
         self.sites.append(new_site)
         
-    # I could potentially add the O_loc function here as a method to Op
+    # Could potentially add the O_loc function here as a method to Op
         
         return
 
@@ -72,210 +73,200 @@ class Psi:
         
         if E is None:
             E=np.mean(E_loc)
-        
-        outr = self.real_comp(s).flatten()
-        outi = self.imag_comp(s).flatten()
-        
+                
         E=np.conj(E)
         E_loc=np.conj(E_loc)
         diff=(E_loc-E)
-        mult=torch.tensor(np.real(2*diff),dtype=torch.float)
         
         self.real_comp.zero_grad()
         self.imag_comp.zero_grad()
         # should be the simpler form to apply dln(Psi)/dw_i
         if self.form.lower()=='euler':
+            
+            outr = self.real_comp(s).flatten()
+            outi = self.imag_comp(s).flatten()
+            
             # each form has a slightly different multiplication form
+            # MODULUS
+            mult=torch.tensor(np.real(2*diff),dtype=torch.float)
             (outr.log()*mult).mean().backward()
             # calling this applies autograd to tensor .grad object i.e. out*mult
             # which corresponds to dpsi_real(s)/dpars. 
-            # must include the averaging over # samples factor myself 
             
-            # Angle
-            multiplier = 2*np.imag(-E_loc)
-            multiplier=torch.tensor(multiplier,dtype=torch.float)
-            (multiplier*outi).mean().backward()
+            # ANGLE
+            mult = torch.tensor(2*np.imag(-E_loc),dtype=torch.float)
+            (mult*outi).mean().backward()
+            
+        # Although the speed difference is not significant, the above is still 
+        # faster than using the autograd_hacks per sample gradient version used
+        # for the vector gradients below
             
         elif self.form.lower()=='vector':
             if np.all(self.complex==0): 
         # could create errors if doesn't use the updated ppsi and new s
         # but each call of O_local redefines the .complex
                 self.complex_out(s) # define self.complex
+              
+            # hooks accumulate the gradient per sample into layers.backprops_list
+            # only called once otherwise extra grads are accumulated
+            if not hasattr(self.real_comp,'autograd_hacks_hooks'):             
+                autograd_hacks.add_hooks(self.real_comp)
+            if not hasattr(self.imag_comp,'autograd_hacks_hooks'): 
+                autograd_hacks.add_hooks(self.imag_comp)
+            outr=self.real_comp(s)
+            outi=self.imag_comp(s)
+            outr.mean().backward()
+            outi.mean().backward()
+            autograd_hacks.compute_grad1(self.real_comp)
+            autograd_hacks.compute_grad1(self.imag_comp)
             
-            N_samples=s.size(0)
+            m=2*(np.conj(E_loc)-np.conj(E))/self.complex.squeeze()
             
-#            psi0=self.complex.flatten() # the original psi
             p_r=list(self.real_comp.parameters())
-            p_i=list(self.imag_comp.parameters())   
+            p_i=list(self.imag_comp.parameters())
             
-            grad_list_r=copy.deepcopy(p_r)
-            grad_list_i=copy.deepcopy(p_i)
-            with torch.no_grad():
-                for param in grad_list_r:
-                    param.copy_(torch.zeros_like(param))
-                    param.requires_grad=False
-                for param in grad_list_i:
-                    param.copy_(torch.zeros_like(param))
-                    param.requires_grad=False
-
-            # what we calculated the gradients should be
-            for n in range(N_samples):
-                
-                self.real_comp.zero_grad() # important so derivatives aren't summed
-                self.imag_comp.zero_grad()    
-                outr[n].backward(retain_graph=True) # retain so that buffers aren't cleared 
-                                                    # and it can be applied again
-                outi[n].backward(retain_graph=True)
-                                                    
-                with torch.no_grad():        
-                    m= ((E_loc[n]-E)/self.complex[n]) 
-                    # [E_l*-E]/Psi according to derivative
-                    m_r=torch.tensor(2*np.real(m) ,dtype=torch.float)
-                    m_i=torch.tensor(2*np.real(1j*m) ,dtype=torch.float)
-                    
-                for kk in range(len(p_r)):
-                    with torch.no_grad():
-                        grad_list_r[kk]+=(p_r[kk].grad)*(m_r/N_samples)
-                for kk in range(len(p_r)):
-                    with torch.no_grad():
-                        grad_list_i[kk]+=(p_i[kk].grad)*(m_i/N_samples)
-            
-            # manually do the mean
-            for kk in range(len(p_r)):
-                p_r[kk].grad=grad_list_r[kk]
-            for kk in range(len(p_i)):
-                p_i[kk].grad=grad_list_i[kk]            
-                        
-        # for testing purposes
-#        pr1_grad=params[0].grad
-#        pi1_grad=params[0].grad
-            
-        return # pr1_grad, pi1_grad
-
-    def SR(self,s,E_loc, lambduh=1):
-               
-        E0=np.real(np.mean(E_loc))
-        N_samples=s.size(0)
-        
-        outr=self.real_comp(s)
-        outi=self.imag_comp(s)
-        
-        if self.form=='vector':
-            if np.all(self.complex==0):
-                self.complex_out(s)
-        
-        p_r=list(self.real_comp.parameters())
-        p_i=list(self.imag_comp.parameters())
-        
-        grad_list_i=copy.deepcopy(p_i)
-        with torch.no_grad():
-        
-            for param in grad_list_i:
-                param.copy_(torch.zeros_like(param))
-                param.requires_grad=False
-        # have to make a copy to record the gradient variable Ok and the force DE
-        Ok_list_r=[]
-        Ok_list_i=[]
-        with torch.no_grad():
-            grad_list_r=copy.deepcopy(p_r)
-            for ii in range(len(p_r)):
-                grad_list_r[ii].copy_(torch.zeros_like(p_r[ii]))
-                grad_list_r[ii].requires_grad=False
-                if len(p_r[ii].size())==1:
-                    sz1,sz2=p_r[ii].size(0),1    
-                else:
-                    sz1,sz2=p_r[ii].size()
-                Ok_list_r.append(np.zeros([N_samples,sz1,sz2],dtype=complex))
-                
-            grad_list_i=copy.deepcopy(p_i)
-            for ii in range(len(p_i)):
-                grad_list_i[ii].copy_(torch.zeros_like(p_i[ii]))
-                grad_list_i[ii].requires_grad=False
-                if len(p_i[ii].size())==1:
-                    sz1,sz2=p_i[ii].size(0),1    
-                else:
-                    sz1,sz2=p_i[ii].size()
-                Ok_list_i.append(np.zeros([N_samples,sz1,sz2],dtype=complex))
-                
-        # what we calculated the gradients should be
-        for n in range(N_samples):
-            
-            self.real_comp.zero_grad()
-            self.imag_comp.zero_grad()
-        
-            outr[n].backward(retain_graph=True) # retain so that buffers aren't cleared 
-            outi[n].backward(retain_graph=True)     # and it can be applied again
-            
-            # get the multipliers (Ok=dpsi*m) and the energy gradients for each term
-            if self.form=='vector':
-                m_r=(1/self.complex[n])
-                m_i=1j*m_r
-            else:
-                m_r=1/outr[n].detach().numpy()
-                m_i=1j
-            
-            # term for the force
-            E_arg=(np.conj(E_loc[n])-np.conj(E0))
-                  
-            for kk in range(len(p_r)):
-                with torch.no_grad():
-                    grad_list_r[kk]+=(p_r[kk].grad)*torch.tensor(\
-                    (2*np.real(E_arg*m_r)/N_samples),dtype=torch.float)
-                    Ok=p_r[kk].grad.numpy()*m_r
-                    # to deal with 1-dim params
-                    if len(np.shape(Ok))==1:
-                        Ok=Ok[:,None]
-        #            E_Ok=np.mean(Ok,1)[:,None]
-        #            S=2*np.real(np.matmul(np.conj(Ok),Ok.T)-\
-        #                        np.matmul(np.conj(E_Ok),E_Ok.T))
-                    Ok_list_r[kk][n]=Ok
-        
-            for kk in range(len(p_i)):
-                with torch.no_grad():
-                    grad_list_i[kk]+=(p_i[kk].grad)*torch.tensor(\
-                    (2*np.real(E_arg*m_i)/N_samples),dtype=torch.float)
-                    Ok=p_i[kk].grad.numpy()*m_i
-                    if len(np.shape(Ok))==1:
-                        Ok=Ok[:,None]
-                    Ok_list_i[kk][n]=Ok
-        # unfortunately, must record Ok for each sample so an expectation <Ok> can be taken
-        # This could be a memory/speed issue, but I don't see an obvious route around it
-                    
-        S_list_r=[]
-        for kk in range(len(Ok_list_r)):
-            Exp_Ok=np.mean(Ok_list_r[kk],0)  # conj(mean)=mean(conj)
-        #    T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
-            T1=np.einsum('kni,imk->nm',np.conj(Ok_list_r[kk]),Ok_list_r[kk].T)/N_samples
-            # These are methods are equivalent! Good sanity check
-            St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
-            l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
-            S_list_r.append(St+l_reg) 
-        
-        S_list_i=[]
-        for kk in range(len(Ok_list_i)):
-            Exp_Ok=np.mean(Ok_list_i[kk],0) 
-            T1=np.einsum('kni,imk->nm',np.conj(Ok_list_i[kk]),Ok_list_i[kk].T)/N_samples
-            St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
-            l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
-            S_list_i.append(St+l_reg) 
-        
-        for kk in range(len(p_r)):
-            S_inv=torch.tensor(np.linalg.pinv(S_list_r[kk]),dtype=torch.float) # have to inverse S
-            if len(grad_list_r[kk].size())==1: # deal with .mm issues when vector Mx1        
-                p_r[kk].grad=(torch.mm(S_inv,grad_list_r[kk][:,None]))\
-                .view(p_r[kk].size()).detach()
-            else:
-                p_r[kk].grad=torch.mm(S_inv,grad_list_r[kk])
-        
-        for kk in range(len(p_i)):
-            S_inv=torch.tensor(np.linalg.pinv(S_list_i[kk]),dtype=torch.float) # have to inverse S
-            if len(grad_list_i[kk].size())==1: # deal with .mm issues when vector Mx1        
-                p_i[kk].grad=(torch.mm(S_inv,grad_list_i[kk][:,None]))\
-                .view(p_i[kk].size()).detach()
-            else:
-                p_i[kk].grad=torch.mm(S_inv,grad_list_i[kk])
+            # multiplying the base per sample grad in param.grad1 by the dPsi
+            # derivative term and assigning to the .grad variable to be applied 
+            # to each parameter variable with the apply_grad function. 
+            for param in p_r:
+                if len(param.size())==2:
+                    ein_str="i,ijk->ijk"
+                elif len(param.size())==1:
+                    ein_str="i,ik->ik"
+                param.grad=torch.einsum(ein_str,torch.tensor(np.real(m)\
+                    ,dtype=torch.float),param.grad1).mean(0)
+            for param in p_i: # dPsi here is 1j*dPsi of real
+                if len(param.size())==2:
+                    ein_str="i,ijk->ijk"
+                elif len(param.size())==1:
+                    ein_str="i,ik->ik"
+                param.grad=torch.einsum(ein_str,torch.tensor(np.real(1j*m)\
+                    ,dtype=torch.float),param.grad1).mean(0)
+          
+            # clear backprops_list for next run
+            autograd_hacks.clear_backprops(self.real_comp)
+            autograd_hacks.clear_backprops(self.imag_comp)
             
         return 
+
+    def SR(self,s,E_loc, lambduh=1, cutoff=1e-8): 
+        
+        E0=np.real(np.mean(E_loc))
+    
+        if self.form=='vector':
+            if np.all(self.complex==0): 
+                self.complex_out(s)
+            m_r=(1/self.complex).squeeze()
+            m_i=1j*m_r
+        else:
+            m_r=1/self.real_comp(s).detach().numpy().squeeze()
+            m_i=(np.ones([s.shape[0],1])*1j).squeeze()
+        E_arg=(np.conj(E_loc)-np.conj(E0))
+        
+        for ii in range(2):
+            if ii==0:# Compute SR for real component
+                model=self.real_comp; m=m_r
+            else:
+                model=self.imag_comp; m=m_i
+                
+            model.zero_grad()
+            N_samples=s.shape[0]
+            
+            if not hasattr(model,'autograd_hacks_hooks'):             
+                autograd_hacks.add_hooks(model)
+            outr=model(s)
+            outr.mean().backward()
+            autograd_hacks.compute_grad1(model) #computes grad per sample for all samples
+            autograd_hacks.clear_backprops(model)
+            pars=list(model.parameters())
+                
+            for param in pars:
+                with torch.no_grad():
+                    if len(param.size())==2:#different mat mul rules depending on mat shape
+                        ein_str="i,ijk->ijk"
+                    elif len(param.size())==1:
+                        ein_str="i,ik->ik"
+                    if len(param.size())>1:
+                        if param.size(1)>param.size(0): # pytorch flips matrix pattern sometimes
+        # have to manually flip it back. (else get S=scalar for Nx1 matrix xforms-can't be right)
+                            param.grad1=param.grad1.view(param.grad1.size(0),param.size(1),param.size(0))
+                    Ok=np.einsum(ein_str,m,param.grad1.numpy())
+                    if len(np.shape(Ok))==2:
+                        Ok=Ok[:,:,None] 
+        # Vector bias values do not agree with original method if this is not present
+        # When present though, returns values similar in order to the other param grad values...
+                    Exp_Ok=np.mean(Ok,0) # conj(mean)=mean(conj)
+        #T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
+                    T1=np.einsum("kni,imk->nm",np.conj(Ok),Ok.T)/N_samples
+                # These are methods are equivalent! Good sanity check (einsum more versitile)
+                    St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+         # In NKT, cutoff of 1e-10 is used for S before inverting - inc. numerical stability?
+         # if diagS< cutoff, S(i,i)=1 and s.row=s.col=0. 
+                    St[St<cutoff]=0
+                    l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
+                    S_inv=torch.tensor(np.linalg.pinv(St+l_reg),dtype=torch.float) # S^-1 term with reg
+                    force=torch.einsum(ein_str,torch.tensor(np.real(2*E_arg*m)\
+                    ,dtype=torch.float),param.grad1).mean(0) # force/DE term
+                    # Compute SR 'gradient'
+                    if len(force.size())==1:  # deal with .mm issues when vector Mx1
+                        param.grad=torch.mm(S_inv,force[:,None]).view(param.size()).detach() 
+                    else:
+                        param.grad=torch.mm(S_inv,force).view(param.size()).detach()
+        
+#        self.real_comp.zero_grad(); self.imag_comp.zero_grad()
+#        self.SR_alg(self.real_comp,s,m_r,E_arg)
+#        # Compute SR for real component
+#        self.SR_alg(self.imag_comp,s,m_i,E_arg)
+        
+        return
+        
+#    def SR_alg(model, s, m, E_arg, lambduh=1, cutoff=1e-8):
+#        
+##        model.zero_grad()
+#        N_samples=s.shape[0]
+#        
+#        if not hasattr(model,'autograd_hacks_hooks'):             
+#            autograd_hacks.add_hooks(model)
+#        outr=model(s)
+#        outr.mean().backward()
+#        autograd_hacks.compute_grad1(model) #computes grad per sample for all samples
+#        autograd_hacks.clear_backprops(model)
+#        pars=list(model.parameters())
+#            
+#        for param in pars:
+#            with torch.no_grad():
+#                if len(param.size())==2:#different mat mul rules depending on mat shape
+#                    ein_str="i,ijk->ijk"
+#                elif len(param.size())==1:
+#                    ein_str="i,ik->ik"
+#                if len(param.size())>1:
+#                    if param.size(1)>param.size(0): # pytorch flips matrix pattern sometimes
+#    # have to manually flip it back. (else get S=scalar for Nx1 matrix xforms-can't be right)
+#                        param.grad1=param.grad1.view(param.grad1.size(0),param.size(1),param.size(0))
+#                Ok=np.einsum(ein_str,m,param.grad1.numpy())
+#                if len(np.shape(Ok))==2:
+#                    Ok=Ok[:,:,None] 
+#    # Vector bias values do not agree with original method if this is not present
+#    # When present though, returns values similar in order to the other param grad values...
+#                Exp_Ok=np.mean(Ok,0) # conj(mean)=mean(conj)
+#    #T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
+#                T1=np.einsum("kni,imk->nm",np.conj(Ok),Ok.T)/N_samples
+#            # These are methods are equivalent! Good sanity check (einsum more versitile)
+#                St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+#     # In NKT, cutoff of 1e-10 is used for S before inverting - inc. numerical stability?
+#     # if diagS< cutoff, S(i,i)=1 and s.row=s.col=0. 
+#                St[St<cutoff]=0
+#                l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
+#                S_inv=torch.tensor(np.linalg.pinv(St+l_reg),dtype=torch.float) # S^-1 term with reg
+#                force=torch.einsum(ein_str,torch.tensor(np.real(2*E_arg*m)\
+#                ,dtype=torch.float),param.grad1).mean(0) # force/DE term
+#                # Compute SR 'gradient'
+#                if len(force.size())==1:  # deal with .mm issues when vector Mx1
+#                    param.grad=torch.mm(S_inv,force[:,None]).view(param.size()).detach() 
+#                else:
+#                    param.grad=torch.mm(S_inv,force).view(param.size()).detach()
+#        
+#        return
 
     def apply_grad(self, lr=0.03):
         
@@ -510,3 +501,218 @@ def kron_matrix_gen(op_list,D,N,bc):
     return matrix
 
 
+
+
+
+
+
+
+# Previously functioning SR and Grad methods (much slower for Psi vector because of loop)
+    
+#    def energy_gradient(self,s,E_loc,E=None): # add Pytorch optimizer) (fixed lr for now)
+#        
+#        if E is None:
+#            E=np.mean(E_loc)
+#        
+#        outr = self.real_comp(s).flatten()
+#        outi = self.imag_comp(s).flatten()
+#        
+#        E=np.conj(E)
+#        E_loc=np.conj(E_loc)
+#        diff=(E_loc-E)
+#        mult=torch.tensor(np.real(2*diff),dtype=torch.float)
+#        
+#        self.real_comp.zero_grad()
+#        self.imag_comp.zero_grad()
+#        # should be the simpler form to apply dln(Psi)/dw_i
+#        if self.form.lower()=='euler':
+#            # each form has a slightly different multiplication form
+#            (outr.log()*mult).mean().backward()
+#            # calling this applies autograd to tensor .grad object i.e. out*mult
+#            # which corresponds to dpsi_real(s)/dpars. 
+#            # must include the averaging over # samples factor myself 
+#            
+#            # Angle
+#            multiplier = 2*np.imag(-E_loc)
+#            multiplier=torch.tensor(multiplier,dtype=torch.float)
+#            (multiplier*outi).mean().backward()
+#            
+#        elif self.form.lower()=='vector':
+#            if np.all(self.complex==0): 
+#        # could create errors if doesn't use the updated ppsi and new s
+#        # but each call of O_local redefines the .complex
+#                self.complex_out(s) # define self.complex
+#            
+#            N_samples=s.size(0)
+#            
+#            p_r=list(self.real_comp.parameters())
+#            p_i=list(self.imag_comp.parameters())   
+#            
+#            grad_list_r=copy.deepcopy(p_r)
+#            grad_list_i=copy.deepcopy(p_i)
+#            with torch.no_grad():
+#                for param in grad_list_r:
+#                    param.copy_(torch.zeros_like(param))
+#                    param.requires_grad=False
+#                for param in grad_list_i:
+#                    param.copy_(torch.zeros_like(param))
+#                    param.requires_grad=False
+#
+#            # what we calculated the gradients should be
+#            for n in range(N_samples):
+#                
+#                self.real_comp.zero_grad() # important so derivatives aren't summed
+#                self.imag_comp.zero_grad()    
+#                outr[n].backward(retain_graph=True) # retain so that buffers aren't cleared 
+#                                                    # and it can be applied again
+#                outi[n].backward(retain_graph=True)
+#                                                    
+#                with torch.no_grad():        
+#                    m= ((E_loc[n]-E)/self.complex[n]) 
+#                    # [E_l*-E]/Psi according to derivative
+#                    m_r=torch.tensor(2*np.real(m) ,dtype=torch.float)
+#                    m_i=torch.tensor(2*np.real(1j*m) ,dtype=torch.float)
+#                    
+#                for kk in range(len(p_r)):
+#                    with torch.no_grad():
+#                        grad_list_r[kk]+=(p_r[kk].grad)*(m_r/N_samples)
+#                for kk in range(len(p_r)):
+#                    with torch.no_grad():
+#                        grad_list_i[kk]+=(p_i[kk].grad)*(m_i/N_samples)
+#            
+#            # manually do the mean
+#            for kk in range(len(p_r)):
+#                p_r[kk].grad=grad_list_r[kk]
+#            for kk in range(len(p_i)):
+#                p_i[kk].grad=grad_list_i[kk]            
+#                        
+#        # for testing purposes
+##        pr1_grad=params[0].grad
+##        pi1_grad=params[0].grad
+#            
+#        return # pr1_grad, pi1_grad
+
+#    def SR(self,s,E_loc, lambduh=1):
+#               
+#        E0=np.real(np.mean(E_loc))
+#        N_samples=s.size(0)
+#        
+#        outr=self.real_comp(s)
+#        outi=self.imag_comp(s)
+#        
+#        if self.form=='vector':
+#            if np.all(self.complex==0):
+#                self.complex_out(s)
+#        
+#        p_r=list(self.real_comp.parameters())
+#        p_i=list(self.imag_comp.parameters())
+#        
+#        grad_list_i=copy.deepcopy(p_i)
+#        with torch.no_grad():
+#        
+#            for param in grad_list_i:
+#                param.copy_(torch.zeros_like(param))
+#                param.requires_grad=False
+#        # have to make a copy to record the gradient variable Ok and the force DE
+#        Ok_list_r=[]
+#        Ok_list_i=[]
+#        with torch.no_grad():
+#            grad_list_r=copy.deepcopy(p_r)
+#            for ii in range(len(p_r)):
+#                grad_list_r[ii].copy_(torch.zeros_like(p_r[ii]))
+#                grad_list_r[ii].requires_grad=False
+#                if len(p_r[ii].size())==1:
+#                    sz1,sz2=p_r[ii].size(0),1    
+#                else:
+#                    sz1,sz2=p_r[ii].size()
+#                Ok_list_r.append(np.zeros([N_samples,sz1,sz2],dtype=complex))
+#                
+#            grad_list_i=copy.deepcopy(p_i)
+#            for ii in range(len(p_i)):
+#                grad_list_i[ii].copy_(torch.zeros_like(p_i[ii]))
+#                grad_list_i[ii].requires_grad=False
+#                if len(p_i[ii].size())==1:
+#                    sz1,sz2=p_i[ii].size(0),1    
+#                else:
+#                    sz1,sz2=p_i[ii].size()
+#                Ok_list_i.append(np.zeros([N_samples,sz1,sz2],dtype=complex))
+#                
+#        # what we calculated the gradients should be
+#        for n in range(N_samples):
+#            
+#            self.real_comp.zero_grad()
+#            self.imag_comp.zero_grad()
+#        
+#            outr[n].backward(retain_graph=True) # retain so that buffers aren't cleared 
+#            outi[n].backward(retain_graph=True)     # and it can be applied again
+#            
+#            # get the multipliers (Ok=dpsi*m) and the energy gradients for each term
+#            if self.form=='vector':
+#                m_r=(1/self.complex[n])
+#                m_i=1j*m_r
+#            else:
+#                m_r=1/outr[n].detach().numpy()
+#                m_i=1j
+#            
+#            # term for the force
+#            E_arg=(np.conj(E_loc[n])-np.conj(E0))
+#                  
+#            for kk in range(len(p_r)):
+#                with torch.no_grad():
+#                    grad_list_r[kk]+=(p_r[kk].grad)*torch.tensor(\
+#                    (2*np.real(E_arg*m_r)/N_samples),dtype=torch.float)
+#                    Ok=p_r[kk].grad.numpy()*m_r
+#                    # to deal with 1-dim params
+#                    if len(np.shape(Ok))==1:
+#                        Ok=Ok[:,None]
+#        #            E_Ok=np.mean(Ok,1)[:,None]
+#        #            S=2*np.real(np.matmul(np.conj(Ok),Ok.T)-\
+#        #                        np.matmul(np.conj(E_Ok),E_Ok.T))
+#                    Ok_list_r[kk][n]=Ok
+#        
+#            for kk in range(len(p_i)):
+#                with torch.no_grad():
+#                    grad_list_i[kk]+=(p_i[kk].grad)*torch.tensor(\
+#                    (2*np.real(E_arg*m_i)/N_samples),dtype=torch.float)
+#                    Ok=p_i[kk].grad.numpy()*m_i
+#                    if len(np.shape(Ok))==1:
+#                        Ok=Ok[:,None]
+#                    Ok_list_i[kk][n]=Ok
+#        # unfortunately, must record Ok for each sample so an expectation <Ok> can be taken
+#        # This could be a memory/speed issue, but I don't see an obvious route around it
+#                    
+#        S_list_r=[]
+#        for kk in range(len(Ok_list_r)):
+#            Exp_Ok=np.mean(Ok_list_r[kk],0)  # conj(mean)=mean(conj)
+#        #    T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
+#            T1=np.einsum('kni,imk->nm',np.conj(Ok_list_r[kk]),Ok_list_r[kk].T)/N_samples
+#            # These are methods are equivalent! Good sanity check
+#            St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+#            l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
+#            S_list_r.append(St+l_reg) 
+#        
+#        S_list_i=[]
+#        for kk in range(len(Ok_list_i)):
+#            Exp_Ok=np.mean(Ok_list_i[kk],0) 
+#            T1=np.einsum('kni,imk->nm',np.conj(Ok_list_i[kk]),Ok_list_i[kk].T)/N_samples
+#            St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+#            l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
+#            S_list_i.append(St+l_reg) 
+#        
+#        for kk in range(len(p_r)):
+#            S_inv=torch.tensor(np.linalg.pinv(S_list_r[kk]),dtype=torch.float) # have to inverse S
+#            if len(grad_list_r[kk].size())==1: # deal with .mm issues when vector Mx1        
+#                p_r[kk].grad=(torch.mm(S_inv,grad_list_r[kk][:,None]))\
+#                .view(p_r[kk].size()).detach()
+#            else:
+#                p_r[kk].grad=torch.mm(S_inv,grad_list_r[kk])
+#        
+#        for kk in range(len(p_i)):
+#            S_inv=torch.tensor(np.linalg.pinv(S_list_i[kk]),dtype=torch.float) # have to inverse S
+#            if len(grad_list_i[kk].size())==1: # deal with .mm issues when vector Mx1        
+#                p_i[kk].grad=(torch.mm(S_inv,grad_list_i[kk][:,None]))\
+#                .view(p_i[kk].size()).detach()
+#            else:
+#                p_i[kk].grad=torch.mm(S_inv,grad_list_i[kk])
+#            
+#        return 

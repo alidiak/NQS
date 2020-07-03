@@ -20,11 +20,14 @@ import torch.nn as nn
 import numpy as np
 from NQS_pytorch import Op, Psi, O_local, kron_matrix_gen
 import itertools
+import autograd_hacks # module that returns grad per sample
+import time
+
 
 # system parameters
 b=0.5   # b-field strength
 J=1     # nearest neighbor interaction strength
-L = 6   # system size
+L = 3   # system size
 burn_in=1000
 N_samples=10000 # number of samples for the Monte Carlo chains
 
@@ -117,17 +120,32 @@ E_loc=np.sum(H_nn+H_b,axis=1)
 
 angle_net=copy.deepcopy(ppsi_mod)
 
+#start = time.time()
+#autograd_hacks.add_hooks(ppsi_mod.imag_comp)
 outi=ppsi_mod.imag_comp(s)
+#outi.mean().backward()
+#autograd_hacks.compute_grad1(ppsi_mod.imag_comp)
 
 # what we calculated the gradients should be
 mult=torch.tensor(2*np.imag(-np.conj(E_loc)),dtype=torch.float)
 
 ppsi_mod.imag_comp.zero_grad()
-(outi*mult[:,None]).mean().backward()
 
-modi_params=list(angle_net.imag_comp.parameters())
+#for param in modi_params:
+#    if len(param.size())==2:
+#        param.grad=torch.einsum("i,ijk->ijk",mult,param.grad1).mean(0)
+#    elif len(param.size())==1:
+#        param.grad=torch.einsum("i,ik->ik",mult,param.grad1).mean(0)
+
+(outi*mult[:,None]).mean().backward()
+#end=time.time(); print(end-start)
+
 pars=list(ppsi_mod.imag_comp.parameters())
 grad0=pars[0].grad 
+modi_params=list(angle_net.imag_comp.parameters())
+
+#[p1_r,p1_i]=ppsi_mod.apply_energy_gradient(s,E_loc,np.mean(E_loc),0.03)
+#print(p1_i-grad0) # testing to make sure algorithm is working the same.
 
 dw=0.001 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
@@ -171,6 +189,15 @@ Ok=np.squeeze(Ok)
 deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
 Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))
 
+# all equivalent methods
+Force=Exp_val(np.conj(Ok)*E_loc,wvf0)-Exp_val(E_loc,wvf0)*Exp_val(np.conj(Ok),wvf0)
+deriv_E01= Force+np.conj(Force)
+
+deriv_E02=Exp_val(np.squeeze(2*np.real((np.conj(E_loc)-\
+                    np.conj(Exp_val(E_loc,wvf0)))*Ok)),wvf0)
+
+S=np.linalg.pinv(Exp_val(np.matmul(Ok,Ok.T),wvf0)-Exp_val(Ok,wvf0)*Exp_val(Ok.T,wvf0))
+
 print('\n Expecation val deriv: ', deriv_E0, '\n vs numerical wvf energy diff: ', dif)
 
 ''' ######################## MODULUS COMPONENT CALC ##################### '''
@@ -193,6 +220,9 @@ mult=torch.tensor((2*np.real(np.conj(E_loc)-np.conj(E0))))
 
 pars=list(ppsi_mod.real_comp.parameters())
 grad0=pars[0].grad 
+
+#[p1_r,p1_i]=ppsi_mod.apply_energy_gradient(s,E_loc,np.mean(E_loc),0.03)
+#print(p1_r-grad0) # testing to make sure algorithm is working the same.
 
 pars2=list(mod_net.real_comp.parameters())
 dw=0.001 # sometimes less accurate when smaller than 1e-3
@@ -234,6 +264,9 @@ Ok=np.squeeze(Ok)
 deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
 Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))
 
+#Ok=grad_list[0].numpy()
+#S=np.linalg.pinv(Exp_val(np.matmul(Ok,Ok.T),wvf0)-Exp_val(Ok,wvf0)*Exp_val(Ok.T,wvf0))
+
 print('\n Expecation val deriv: ', deriv_E0, '\n vs numerical wvf energy diff: ', dif)
 
 ''' Now with vector version '''
@@ -246,44 +279,31 @@ real_net=copy.deepcopy(ppsi_vec)
 sb=ppsi_vec.sample_MH(burn_in,spin=0.5)
 s=torch.tensor(ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float)
 
-psi0=ppsi_vec.complex_out(s)
+psi0=ppsi_vec.complex_out(s).squeeze()
 
 [H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_vec),O_local(b_field,s.numpy(),ppsi_vec)
 E_loc=np.sum(H_nn+H_b,axis=1)
 E0=np.real(np.mean(E_loc))
 
+autograd_hacks.add_hooks(ppsi_vec.real_comp)
 outr=ppsi_vec.real_comp(s)
+outr.mean().backward()
+autograd_hacks.compute_grad1(ppsi_vec.real_comp)
+
+mult=torch.tensor(np.real(2*(np.conj(E_loc)-np.conj(E0))/psi0),dtype=torch.float)
 
 ppsi_vec.real_comp.zero_grad()
+
 pars=list(ppsi_vec.real_comp.parameters())
 
-# have to make a sort of copy to record the modified gradient
-grad_list=copy.deepcopy(pars)
-with torch.no_grad():
-    for param in grad_list:
-        param.copy_(torch.zeros_like(param))
-        param.requires_grad=False
-    
-# what we calculated the gradients should be
-for n in range(N_samples):
-    
-    ppsi_vec.real_comp.zero_grad()
-    outr[n].backward(retain_graph=True) # retain so that buffers aren't cleared 
-                                        # and it can be applied again
-    m= 2*np.real((np.conj(E_loc[n])-np.conj(E0))/psi0[n])  # 1/Psi(s) multiplier according to derivative
-          
-    m=torch.tensor(m,dtype=torch.float)
-    for kk in range(len(pars)):
-        with torch.no_grad():
-            grad_list[kk]+=(pars[kk].grad)*(m/N_samples)
+for param in pars:
+    if len(param.size())==2:
+        param.grad=torch.einsum("i,ijk->ijk",mult,param.grad1).mean(0)
+    elif len(param.size())==1:
+        param.grad=torch.einsum("i,ik->ik",mult,param.grad1).mean(0)    
+grad0=pars[0].grad 
 
-
-for kk in range(len(pars)):
-    pars[kk].grad=grad_list[kk]
-
-grad0=grad_list[0]
-
-dw=0.01 # sometimes less accurate when smaller than 1e-3
+dw=0.001 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
     pars[0][0][0]=pars[0][0][0]+dw
 
@@ -331,37 +351,30 @@ imag_net=copy.deepcopy(ppsi_vec)
 sb=ppsi_vec.sample_MH(burn_in,spin=0.5)
 s=torch.tensor(ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float)
 
-psi0=ppsi_vec.complex_out(s) # the original psi
+psi0=ppsi_vec.complex_out(s).squeeze() # the original psi
 
 [H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_vec),O_local(b_field,s.numpy(),ppsi_vec)
 E_loc=np.sum(H_nn+H_b,axis=1)
 E0=np.mean(E_loc) 
 
-out=ppsi_vec.imag_comp(s)
+autograd_hacks.add_hooks(ppsi_vec.imag_comp)
+outi=ppsi_vec.imag_comp(s)
+outi.mean().backward()
+autograd_hacks.compute_grad1(ppsi_vec.imag_comp)
+
+mult=torch.tensor(np.real(2j*(np.conj(E_loc)-np.conj(E0))/psi0),dtype=torch.float)
+
+ppsi_vec.imag_comp.zero_grad()
 
 pars=list(ppsi_vec.imag_comp.parameters())
 
-par_list=[]
-for k in range(len(pars)):
-    par_list.append(np.zeros_like(pars[k].detach().numpy(), dtype=complex))
+for param in pars:
+    if len(param.size())==2:
+        param.grad=torch.einsum("i,ijk->ijk",mult,param.grad1).mean(0)
+    elif len(param.size())==1:
+        param.grad=torch.einsum("i,ik->ik",mult,param.grad1).mean(0)    
 
-# what we calculated the gradients should be
-for n in range(N_samples):
-
-    ppsi_vec.imag_comp.zero_grad()    
-    out[n].backward(retain_graph=True) # retain so that buffers aren't cleared 
-                                        # and it can be applied agai
-    with torch.no_grad():        
-        m= 2*np.real((np.conj(E_loc[n])-np.conj(E0))*1j/psi0[n]) # 1i/Psi according to derivative
-            
-    for kk in range(len(pars)):
-        par_list[kk]+=(pars[kk].grad.detach().numpy())*m            
-            
-# manually do the mean
-for kk in range(len(pars)):
-    par_list[kk]=par_list[kk]/N_samples
-
-grad0=par_list[0]
+grad0=pars[0].grad 
 
 dw=0.001 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():

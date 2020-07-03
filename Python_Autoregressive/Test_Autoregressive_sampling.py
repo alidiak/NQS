@@ -6,8 +6,8 @@ Created on Wed Jun 24 16:15:18 2020
 @author: alex
 """
 
-import time
 import numpy as np
+from made import MADE
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -17,8 +17,7 @@ from NQS_pytorch import Psi, Op, O_local
 b=0.5   # b-field strength
 J=1     # nearest neighbor interaction strength
 L = 3   # system size
-burn_in=1000
-N_samples=10000 # number of samples for the Monte Carlo chains
+N_samples=1000 # number of samples for the Monte Carlo chains
 
 spin=0.5    # routine may not be optimized yet for spin!=0.5
 evals=2*np.arange(-spin,spin+1)
@@ -40,74 +39,79 @@ for i in range(L):  # Specify the sites upon which the operators act
 
 '''##### Define Neural Networks and initialization funcs for psi  #####'''
 
-def psi_init(L, H=2*L, Form='euler'):
-    toy_model=nn.Sequential(nn.Linear(L,H),nn.Sigmoid(), 
-                       nn.Linear(H,1))#,nn.Sigmoid()) 
-    H2=round(H/2)
-    toy_model2=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),
-                     nn.Linear(H2,1))#,nn.Sigmoid()) 
+#def psi_init(L, H=2*L, Form='euler'):
+#    toy_model=nn.Sequential(nn.Linear(L,H),nn.Sigmoid(), 
+#                       nn.Linear(H,L),nn.Softmax()) 
+#    H2=round(H/2)
+#    toy_model2=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),
+#                     nn.Linear(H2,L),nn.Softmax()) 
+#
+#    ppsi=Psi(toy_model,toy_model2, L, form=Form)
+#    
+#    return ppsi
 
-    ppsi=Psi(toy_model,toy_model2, L, form=Form)
-    
-    return ppsi
+# Neural Autoregressive Density Estimators (NADEs) output a list of 
+# probabilities equal in size to the input. Futhermore, a softmax function is 
+# handy as it ensures the output is probability like aka falls between 0 and 1.
+# For a simple spin 1/2, only a single Lx1 output is needed as p(1)=1-P(-1),
+# but with increasing number of eigenvalues, the probability and output becomes
+# more complex. 
 
+hidden_layer_sizes=[10,14]
+nout=len(evals)*L
+model_r=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
+#The MADE coded by Andrej Karpath uses Masks to ensure that the
+# autoregressive property is upheld. natural_ordering=False 
+# randomizes autoregressive ordering, while =True makes the autoregressive 
+# order p1=f(s_1),p2=f(s_2,s_1)
+
+model_i=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
 
 '''#################### Autoregressive Sampling ############################'''
 
-ppsi=psi_init(L,2*L,'euler')  # without mult, initializes params randomly
+N_samples=10
 
-sb=ppsi.sample_MH(burn_in,spin=0.5)
-s=torch.tensor(ppsi.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float)
+# initialize/start with a random vector
+s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.float)
 
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi),O_local(b_field,s.numpy(),ppsi)
-E_loc=np.sum(H_nn+H_b,axis=1)
+outr=model_r(s0)
+outi=model_i(s0)
 
+# random ordering each time we sample
+#order=np.random.permutation(range(L))
 
-def sample_MH(self, N_samples, spin=None, evals=None, s0=None, rot=None):
-    # need either the explicit evals or the spin 
-    if spin is None and evals is None:
-        raise ValueError('Either the eigenvalues of the system or the spin\
-                         must be entered')
-            
-    # the rule for flipping/rotating a spin between it's eigenvalues
-    if rot is None:
-        if spin is None:
-            dim=len(evals)
-        else:
-            dim = int(2*spin+1)
-        rot =  2*np.pi/dim # assume a rotation that scales with # evals
-        # note, can only rotate to 'intermediate/nearby' evals
+Ppsi=torch.ones([N_samples]); # the full Psi is a product of the conditionals, making a running product easy
 
-    if evals is None:
-        evals=2*np.arange(-spin,spin+1) # +1 is just so s=spin is included
-        # times 2 is just the convention that's been used, spin evals of -1,1
+new_s=torch.zeros_like(s0) 
+
+# Begin the autoregressive sampling routine
+for ii in range(0,nout,2):
     
-    if s0 is None:
-        s0=np.random.choice(evals,size=self.L)
+    # normalized probability/wavefunction
+    vi=outr[:,ii]
+    vi2=outr[:,ii+1]
+    exp_vi=torch.exp(vi) # unnorm prob of either 1 or 0 
+    exp_vi2=torch.exp(vi2) 
+    norm_const=torch.sqrt((torch.pow(torch.abs(exp_vi),2)+\
+                           torch.pow(torch.abs(exp_vi2),2)))
+    psi1=exp_vi/norm_const
+    psi2=(exp_vi2)/norm_const
     
-    self.samples=np.zeros([N_samples,self.L])
-    self.samples[0,:]=s0
-    for n in range(N_samples-1):
-        
-        pos=np.random.randint(self.L) # position to change
-        
-        alt_state = self.samples[n,:].copy() # next potential state
-        
-        if np.random.rand()>=0.5:
-            alt_state[pos] = np.real(np.exp(1j*rot)*alt_state[pos]) # flip next random position for spin
-        else:
-            alt_state[pos] = np.real(np.exp(-1j*rot)*alt_state[pos]) # same chance to flip other direction
-        # Will have to generalize to complex vals sometime
-        
-        # Probabilty of the next state divided by the current
-        prob = (np.square(np.abs(self.complex_out(torch.tensor(alt_state,dtype=torch.float)))))   \
-        /(np.square(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=torch.float)))))
-        
-        A = min(1,prob) # Metropolis Hastings acceptance formula
+    born_psi1=torch.pow(torch.abs(psi1),2)
+    born_psi2=torch.pow(torch.abs(psi2),2)
+    
+    # satisfy the normalization condition?
+    assert torch.all(born_psi1+born_psi2-1<1e-6), "Psi not normalized correctly"
 
-        if A ==1: self.samples[n+1,:]=alt_state
-        else: 
-            if np.random.rand()<A: self.samples[n+1,:]=alt_state # accepting move with prob
-            else: self.samples[n+1,:] = self.samples[n,:]
+    # Now let's sample from the binary distribution
+    rands=torch.rand(N_samples)
+    
+    new_s[:,round(ii/2)]=torch.ones([N_samples])+2*(rands<=born_psi1)*evals[0] 
+                        #+(rands>born_psi2)*evals[1]
         
-    return self.samples
+    # Accumulating Psi
+    psi_s=(rands<born_psi1)*1*psi1+(rands>born_psi2)*1*psi2
+    Ppsi=Ppsi*psi_s
+
+
+        
