@@ -12,7 +12,6 @@ Here we keep classes and functions for the Pytorch Quantum States library.
 import itertools
 import numpy as np
 import torch
-import copy
 import autograd_hacks
 
 class Op:
@@ -29,36 +28,47 @@ class Op:
         return
 
 '''###################### Complex Psi ######################################'''
-
+# can change all s to self.samples if running optimization
 class Psi:
     
-    def __init__(self,real_comp,imag_comp,L,form=None):
+    def __init__(self,real_comp,imag_comp,L,form='euler', dtype=torch.float):
         # options for form are 'euler' or 'vector' - corresponding to 2 forms 
         # of complex number notation
-        self.real_comp=real_comp
-        self.imag_comp=imag_comp
         self.complex=0
         self.L=L
         self.samples=0
-        if form==None: # setting the default form as magnitude/angle(phase)
-            self.form='euler'
+        if isinstance(dtype,str):
+            if dtype.lower()=='double':
+                self.dtype=torch.double
+            else: self.dtype=torch.float
         else:
-            self.form=form
+            self.dtype=dtype
+        if self.dtype==torch.double:
+            self.real_comp=real_comp.double() # converts model params to double acc.
+            self.imag_comp=imag_comp.double()
+        else:
+            self.real_comp=real_comp
+            self.imag_comp=imag_comp
+        self.form=form
         
     # Method to return the complex number specified by the state of the 
     # 2 ANNs real_comp and imag_comp and an input state s
     def complex_out(self, s):
-        self.complex=np.zeros(s.size(0),dtype=complex) # complex number for each sample
+        self.complex=np.zeros(s.size(0),dtype=np.complex128) # complex number for each sample
         if self.form.lower()=='euler':
             self.complex=self.real_comp(s).detach().numpy()*    \
             np.exp(1j*self.imag_comp(s).detach().numpy())
         elif self.form.lower()=='vector':
             self.complex=self.real_comp(s).detach().numpy()+    \
             1j*self.imag_comp(s).detach().numpy()
+        elif self.form.lower()=='exponential':
+            self.complex=np.exp(self.real_comp(s).detach().numpy()+    \
+            1j*self.imag_comp(s).detach().numpy())
         else:
             raise Warning('Specified form', self.form, ' for complex number is'\
-            ' ambiguous, use either "euler": real_comp*e^(i*imag_comp) or vector":'\
-            ' "real_comp+1j*imag_comp. This output was calculated using "euler".')
+            ' ambiguous, use either "euler": real_comp*e^(i*imag_comp), "vector":'\
+            ' real_comp+1j*imag_comp, or "exponential": e^(real_comp+i*imag_comp).'\
+            ' This output was calculated using "euler" (default).')
             self.form='euler'
             self.complex=self.real_comp(s).detach().numpy()*    \
             np.exp(1j*self.imag_comp(s).detach().numpy())
@@ -81,7 +91,7 @@ class Psi:
         self.real_comp.zero_grad()
         self.imag_comp.zero_grad()
         # should be the simpler form to apply dln(Psi)/dw_i
-        if self.form.lower()=='euler':
+        if self.form.lower()=='euler' or self.form.lower()=='exponential':
             
             outr = self.real_comp(s).flatten()
             outi = self.imag_comp(s).flatten()
@@ -89,7 +99,10 @@ class Psi:
             # each form has a slightly different multiplication form
             # MODULUS
             mult=torch.tensor(np.real(2*diff),dtype=torch.float)
-            (outr.log()*mult).mean().backward()
+            if self.form.lower()=='euler':
+                (outr.log()*mult).mean().backward()
+            elif self.form.lower()=='exponential':
+                (mult*outr).mean().backward() 
             # calling this applies autograd to tensor .grad object i.e. out*mult
             # which corresponds to dpsi_real(s)/dpars. 
             
@@ -149,18 +162,22 @@ class Psi:
             
         return 
 
-    def SR(self,s,E_loc, lambduh=1, cutoff=1e-8): 
+    def SR(self,s,E_loc, lambduh=1):#, cutoff=1e-8): 
         
         E0=np.real(np.mean(E_loc))
     
-        if self.form=='vector':
+        if self.form.lower()=='vector':
             if np.all(self.complex==0): 
                 self.complex_out(s)
             m_r=(1/self.complex).squeeze()
             m_i=1j*m_r
-        else:
-            m_r=1/self.real_comp(s).detach().numpy().squeeze()
+        elif self.form.lower()=='euler' or self.form.lower()=='exponential':
+            if self.form.lower()=='euler':
+                m_r=1/self.real_comp(s).detach().numpy().squeeze()
+            else:
+                m_r=(np.ones([s.shape[0],1])).squeeze()
             m_i=(np.ones([s.shape[0],1])*1j).squeeze()
+            
         E_arg=(np.conj(E_loc)-np.conj(E0))
         
         for ii in range(2):
@@ -181,92 +198,28 @@ class Psi:
             pars=list(model.parameters())
                 
             for param in pars:
-                with torch.no_grad():
-                    if len(param.size())==2:#different mat mul rules depending on mat shape
-                        ein_str="i,ijk->ijk"
-                    elif len(param.size())==1:
-                        ein_str="i,ik->ik"
-                    if len(param.size())>1:
-                        if param.size(1)>param.size(0): # pytorch flips matrix pattern sometimes
-        # have to manually flip it back. (else get S=scalar for Nx1 matrix xforms-can't be right)
-                            param.grad1=param.grad1.view(param.grad1.size(0),param.size(1),param.size(0))
-                    Ok=np.einsum(ein_str,m,param.grad1.numpy())
-                    if len(np.shape(Ok))==2:
-                        Ok=Ok[:,:,None] 
-        # Vector bias values do not agree with original method if this is not present
-        # When present though, returns values similar in order to the other param grad values...
-                    Exp_Ok=np.mean(Ok,0) # conj(mean)=mean(conj)
-        #T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
-                    T1=np.einsum("kni,imk->nm",np.conj(Ok),Ok.T)/N_samples
-                # These are methods are equivalent! Good sanity check (einsum more versitile)
-                    St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
-         # In NKT, cutoff of 1e-10 is used for S before inverting - inc. numerical stability?
-         # if diagS< cutoff, S(i,i)=1 and s.row=s.col=0. 
-                    St[St<cutoff]=0
-                    l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
-                    S_inv=torch.tensor(np.linalg.pinv(St+l_reg),dtype=torch.float) # S^-1 term with reg
-                    force=torch.einsum(ein_str,torch.tensor(np.real(2*E_arg*m)\
-                    ,dtype=torch.float),param.grad1).mean(0) # force/DE term
+                with torch.no_grad():      
+                    par_size=param.size() # record original param shape for reshaping
+                    Ok=np.einsum("i,ik->ik",m,param.grad1.view([N_samples,-1]).numpy())
+                    Exp_Ok=np.mean(Ok,0)[:,None] # gives another axis, necessary for matmul
+            #        T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
+                    T1=np.einsum("kn,mk->nm",np.conj(Ok),Ok.T)/N_samples
+                    # These are methods are equivalent! Good sanity check (einsum more versitile)
+                    S=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+#                    S[S<cutoff]=0
+                    l_reg=lambduh*np.eye(S.shape[0],S.shape[1])*np.diag(S) # regulation term
+                    # SVD Inversion alg
+#                    [U,D,VT]=np.linalg.svd(S+l_reg)
+#                    D=np.diag(1/D) # inverting the D matrix, for SVD, M'=V (D^-1) U.T = (U(D^-1)V.T).T
+#                    S_inv=torch.tensor(np.matmul(np.matmul(U,D),VT).T,dtype=torch.float)
+                    S_inv=torch.tensor(np.linalg.pinv(S+l_reg),dtype=torch.double) # S^-1 term with reg
+                    force=torch.einsum("i,ik->ik",torch.tensor(np.real(2*E_arg*m)\
+                    ,dtype=torch.double),param.grad1.view([N_samples,-1])).mean(0) # force/DE term
                     # Compute SR 'gradient'
-                    if len(force.size())==1:  # deal with .mm issues when vector Mx1
-                        param.grad=torch.mm(S_inv,force[:,None]).view(param.size()).detach() 
-                    else:
-                        param.grad=torch.mm(S_inv,force).view(param.size()).detach()
-        
-#        self.real_comp.zero_grad(); self.imag_comp.zero_grad()
-#        self.SR_alg(self.real_comp,s,m_r,E_arg)
-#        # Compute SR for real component
-#        self.SR_alg(self.imag_comp,s,m_i,E_arg)
+                    param.grad=torch.mm(S_inv,force[:,None]).view(par_size).detach() 
         
         return
-        
-#    def SR_alg(model, s, m, E_arg, lambduh=1, cutoff=1e-8):
-#        
-##        model.zero_grad()
-#        N_samples=s.shape[0]
-#        
-#        if not hasattr(model,'autograd_hacks_hooks'):             
-#            autograd_hacks.add_hooks(model)
-#        outr=model(s)
-#        outr.mean().backward()
-#        autograd_hacks.compute_grad1(model) #computes grad per sample for all samples
-#        autograd_hacks.clear_backprops(model)
-#        pars=list(model.parameters())
-#            
-#        for param in pars:
-#            with torch.no_grad():
-#                if len(param.size())==2:#different mat mul rules depending on mat shape
-#                    ein_str="i,ijk->ijk"
-#                elif len(param.size())==1:
-#                    ein_str="i,ik->ik"
-#                if len(param.size())>1:
-#                    if param.size(1)>param.size(0): # pytorch flips matrix pattern sometimes
-#    # have to manually flip it back. (else get S=scalar for Nx1 matrix xforms-can't be right)
-#                        param.grad1=param.grad1.view(param.grad1.size(0),param.size(1),param.size(0))
-#                Ok=np.einsum(ein_str,m,param.grad1.numpy())
-#                if len(np.shape(Ok))==2:
-#                    Ok=Ok[:,:,None] 
-#    # Vector bias values do not agree with original method if this is not present
-#    # When present though, returns values similar in order to the other param grad values...
-#                Exp_Ok=np.mean(Ok,0) # conj(mean)=mean(conj)
-#    #T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
-#                T1=np.einsum("kni,imk->nm",np.conj(Ok),Ok.T)/N_samples
-#            # These are methods are equivalent! Good sanity check (einsum more versitile)
-#                St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
-#     # In NKT, cutoff of 1e-10 is used for S before inverting - inc. numerical stability?
-#     # if diagS< cutoff, S(i,i)=1 and s.row=s.col=0. 
-#                St[St<cutoff]=0
-#                l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
-#                S_inv=torch.tensor(np.linalg.pinv(St+l_reg),dtype=torch.float) # S^-1 term with reg
-#                force=torch.einsum(ein_str,torch.tensor(np.real(2*E_arg*m)\
-#                ,dtype=torch.float),param.grad1).mean(0) # force/DE term
-#                # Compute SR 'gradient'
-#                if len(force.size())==1:  # deal with .mm issues when vector Mx1
-#                    param.grad=torch.mm(S_inv,force[:,None]).view(param.size()).detach() 
-#                else:
-#                    param.grad=torch.mm(S_inv,force).view(param.size()).detach()
-#        
-#        return
+
 
     def apply_grad(self, lr=0.03):
         
@@ -326,8 +279,12 @@ class Psi:
             # Will have to generalize to complex vals sometime
             
             # Probabilty of the next state divided by the current
-            prob = (np.square(np.abs(self.complex_out(torch.tensor(alt_state,dtype=torch.float)))))   \
-            /(np.square(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=torch.float)))))
+            ln_prob=2*(np.log(np.abs(self.complex_out(torch.tensor(alt_state,dtype=torch.float))))\
+            -np.log(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=torch.float)))))
+            # hopefully reduces potential divide by 0 errors
+            prob = np.exp(ln_prob)
+#            (np.square(np.abs(self.complex_out(torch.tensor(alt_state,dtype=torch.float)))))   \
+#            /(np.square(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=torch.float)))))
             
             A = min(1,prob) # Metropolis Hastings acceptance formula
 
@@ -336,6 +293,15 @@ class Psi:
                 if np.random.rand()<A: self.samples[n+1,:]=alt_state # accepting move with prob
                 else: self.samples[n+1,:] = self.samples[n,:]
             
+        return self.samples
+    
+    def Autoregressive_samples(self):
+        
+        assert (list(self.real_comp.parameters())[0]\
+                %list(self.real_comp.parameters())[-1])==0, \
+                "(Input dim)!=int*(Output dim), not an Autoregressive NN"
+        
+        
         return self.samples
     
 '''############################ O_local #######################################
