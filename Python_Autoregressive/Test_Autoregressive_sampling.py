@@ -8,16 +8,18 @@ Created on Wed Jun 24 16:15:18 2020
 
 import numpy as np
 from made import MADE
+import autograd_hacks
 import torch
-import torch.nn as nn
-import matplotlib.pyplot as plt
-from NQS_pytorch import Psi, Op, O_local
+from NQS_pytorch import Psi, Op, kron_matrix_gen
+import time
+import itertools
+import copy
 
 # system parameters
 b=0.5   # b-field strength
 J=1     # nearest neighbor interaction strength
-L = 3   # system size
-N_samples=1000 # number of samples for the Monte Carlo chains
+L = 6   # system size
+N_samples=100 # number of samples for the Monte Carlo chains
 
 spin=0.5    # routine may not be optimized yet for spin!=0.5
 evals=2*np.arange(-spin,spin+1)
@@ -36,19 +38,18 @@ for i in range(L):  # Specify the sites upon which the operators act
     # specify the arbitrary sites which the operators will act on
     b_field.add_site([i])
     nn_interaction.add_site([i,(i+1)%L])
+op_list=[] 
+for ii in range(2): # make sure to change to match Hamiltonian entered above
+    op_list.append(sigmaz)
+H_szsz=-J*kron_matrix_gen(op_list,len(evals),L,'periodic').toarray()
 
-'''##### Define Neural Networks and initialization funcs for psi  #####'''
+op_list2=[]
+op_list2.append(sigmax)
+H_sx=b*kron_matrix_gen(op_list2,len(evals),L,'periodic').toarray()
 
-#def psi_init(L, H=2*L, Form='euler'):
-#    toy_model=nn.Sequential(nn.Linear(L,H),nn.Sigmoid(), 
-#                       nn.Linear(H,L),nn.Softmax()) 
-#    H2=round(H/2)
-#    toy_model2=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),
-#                     nn.Linear(H2,L),nn.Softmax()) 
-#
-#    ppsi=Psi(toy_model,toy_model2, L, form=Form)
-#    
-#    return ppsi
+H_tot=H_szsz+H_sx
+
+'''####### Define Neural Networks and initialization funcs for psi ########'''
 
 # Neural Autoregressive Density Estimators (NADEs) output a list of 
 # probabilities equal in size to the input. Futhermore, a softmax function is 
@@ -67,51 +68,288 @@ model_r=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
 
 model_i=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
 
-'''#################### Autoregressive Sampling ############################'''
+def psi_init(L, hidden_layer_sizes,nout, Form='euler'):
+    model_r=MADE(L,hidden_layer_sizes, nout, \
+                 num_masks=1, natural_ordering=True)
+    model_i=MADE(L,hidden_layer_sizes, nout, \
+                 num_masks=1, natural_ordering=True)
 
-N_samples=10
+    ppsi=Psi(model_r,model_i, L, form=Form,autoregressive=True)
+    
+    return ppsi
+
+'''############### Autoregressive Sampling and Psi ########################'''
 
 # initialize/start with a random vector
+s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.double)
+
+ppsi=psi_init(L,hidden_layer_sizes,nout,'exponential')
+
+start = time.time()
+# Begin the autoregressive sampling and Psi forward pass routine 
+def Autoregressive_pass(ppsi,s,evals):
+    outc=ppsi.complex_out(s) # the complex output given an ansatz form  
+    new_s=torch.zeros_like(s)
+    
+    if len(s.shape)==2:
+        [N_samples,L]=s.shape
+        nout=outc.shape[1]
+    else:
+        [N_samples,L]=1,s.shape[0]
+        nout=outc.shape[0]
+        outc, new_s=outc[None,:], new_s[None,:] # extra dim for calcs
+    
+    nevals=len(evals)
+    
+    # Making sure it is an autoregressive model
+    assert nout/L==nevals,"(Output dim)!=nevals*(Input dim), not an Autoregressive NN"
+            
+    # the full Psi is a product of the conditionals, making a running product easy
+    Ppsi=np.ones([N_samples],dtype=np.complex128) 
+    
+    for ii in range(0, L): # loop over lattice sites
+        
+        if ii==L: nlim=nout+1 # conditions for slicing. Python doesn't take slice
+        else: nlim=nout       # if nout/L=int, so for ii=L, we need (nout+1)/L for 
+                            #  outc[:,nout] to be taken.
+        # normalized probability/wavefunction
+        vi=outc[:,ii:nlim:L] 
+        si=s[:,ii] # the input/chosen si (maybe what I'm missing from prev code/E calc)
+        # The MADE is prob0 for 0-nin outputs and then prob1 for 
+        # nin-2nin outputs, etc. until ((nevals-1)-nevals)*nin outputs 
+        tester=np.arange(0,nout);  # print(tester[ii:nlim:L]) # to see slices 
+        assert len(tester[ii:nlim:L])==nevals, "Network Output missing in calculation"
+        
+        exp_vi=np.exp(vi) # unnorm prob of evals 
+        norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2),1))
+        psi=np.einsum('ij,i->ij', exp_vi, 1/norm_const) # love this tool
+        
+        born_psi=np.power(np.abs(psi),2)
+        
+        # satisfy the normalization condition?
+        assert np.all(np.sum(born_psi,1)-1<1e-6), "Psi not normalized correctly"
+    
+        # Now let's sample from the binary distribution
+        rands=np.random.rand(N_samples)
+        
+        psi_s=np.zeros(N_samples, complex) # needed to accumulate Ppsi
+        checker=np.zeros(N_samples)
+        for jj in range(nevals): 
+        
+            prev_selection=(si.numpy()==evals[jj]) # which s were sampled 
+            # psi(s), accumulate psi for the s that were used to gen samples
+            psi_s+=prev_selection*1*psi[:,jj]
+            
+            # sampling if a<born_psi, sample
+            selection=((0<=rands)*(rands-born_psi[:,jj]<=1.5e-7)) 
+            # Due to precision have to use <=1e-7 as errors will occur
+            # when comparing differences of order 1e-8. (see below check)
+            checker+=selection*1
+            
+            new_s[selection,ii]=evals[jj]
+    
+            rands=rands-born_psi[:,jj] # shifting the rands for the next sampling
+        
+        if not np.all(checker)==1: 
+            prob_ind=np.where(checker==0)
+            raise ValueError("N_samples were not sampled. error at: ", \
+                prob_ind, 'with ', rands[prob_ind], born_psi[prob_ind,:])
+                
+        # Accumulating Ppsi, which is psi_1(s)*psi_2(s)...*psi_L(s)
+        Ppsi=Ppsi*psi_s
+
+    return Ppsi, new_s
+
+end = time.time(); print(end - start)
+
+'''################## Test Autoregressive Property #########################'''
+#L=2
+#nout=len(evals)*L
+## get each spin perm
+#s2=torch.tensor(np.array(list(itertools.product(evals,repeat=L))),dtype=torch.float)
+#
+#ppsi=psi_init(L,hidden_layer_sizes,len(evals)*L,'exponential')
+#
+## Joint probabilities
+#wvf,new_s=Autoregressive_pass(ppsi,s2,evals)
+#
+#def psi_i(ppsi, sn, ii, prev_psi=None):
+#    if ii==L: nlim=nout+1 
+#    else: nlim=nout  
+#    outc=ppsi.complex_out(sn)
+#    vi=outc[ii:nlim:L] # p(s0), p(s1)
+#    selection=(sn[ii].numpy()==evals)
+#    exp_vi=np.exp(vi) 
+#    norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2)))
+#    if not prev_psi==None:
+#        psi=(exp_vi[selection]/norm_const)*prev_psi
+#    else:        
+#        psi=exp_vi[selection]/norm_const 
+#        
+#    return psi
+#
+## computing the conditionals
+#ii, jj=0, 0 # lattice, sample number
+#psi0=psi_i(ppsi,s2[jj],ii) # first conditional psi0
+#psi1=psi_i(ppsi,s2[jj],ii+1)#,prev_psi=psi0) # second conditional psi1
+#                            # only enter prev_psi for full mult. conditional
+#
+## should be equal to the joint probability
+#psi00_c=psi0*psi1
+#print(wvf[0]-psi00_c)
+
+'''################## Test Energy Calculation #########################'''
+
+ppsi=psi_init(L,hidden_layer_sizes,len(evals)*L,'exponential')
+# get each spin perm
+s2=np.array(list(itertools.product(evals,repeat=L)))
+
+wvf,new_s=Autoregressive_pass(ppsi,torch.tensor(s2,dtype=torch.float),evals)
+wvf=wvf[:,None]
+
+E_sx=np.matmul(np.matmul(np.conjugate(wvf.T),H_sx),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
+E_szsz=np.matmul(np.matmul(np.conjugate(wvf.T),H_szsz),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
+E_tot=np.matmul(np.matmul(np.conjugate(wvf.T),H_tot),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
+
+N_samples=10000
 s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.float)
+_,new_s=Autoregressive_pass(ppsi,s0,evals)
+start=time.time()
+_,s = Autoregressive_pass(ppsi,new_s,evals)
+end=time.time(); print(end-start)
+H_nn=ppsi.O_local(nn_interaction,s.numpy())
+H_b=ppsi.O_local(b_field,s.numpy())
 
-outr=model_r(s0)
-outi=model_i(s0)
+print('For psi= \n', wvf, '\n\n the energy (using exact H) is: ', E_tot, '\n while that ' \
+      'predicted with the O_local function is: ', np.sum(np.mean(H_b+H_nn,axis=0)), \
+      '\n\n for the exact Sx H: ', E_sx, ' vs ',np.sum(np.mean(H_b,axis=0)), \
+      '\n\n for exact SzSz H: ', E_szsz ,' vs ', np.sum(np.mean(H_nn,axis=0)))
 
-# random ordering each time we sample
-#order=np.random.permutation(range(L))
+''' Ensuring that <psi|H|psi> = \sum_s |psi(s)|^2 e_loc(s)   '''
 
-Ppsi=torch.ones([N_samples]); # the full Psi is a product of the conditionals, making a running product easy
+H_szsz_ex=ppsi.O_local(nn_interaction,s2)
+H_sz_ex=ppsi.O_local(b_field,s2)
+O_loc_analytic= np.sum(np.matmul((np.abs(wvf.T)**2),(H_szsz_ex+H_sz_ex)))\
+ /(np.matmul(np.conjugate(wvf.T),wvf))
+E_exact=np.matmul(np.matmul(np.conjugate(wvf.T),H_tot),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
 
-new_s=torch.zeros_like(s0) 
+print('\n\n Energy using O_local in the analytical expression: ',O_loc_analytic, \
+      '\n vs. that calculated with matrices: ', E_exact )
 
-# Begin the autoregressive sampling routine
-for ii in range(0,nout,2):
+'''################## Test Energy Gradient #########################'''
+
+# function to apply multipliers to the expectation value O_local expression 
+def Exp_val(mat,wvf):
+    if len(np.shape(mat))==0:
+        O_l= np.sum(mat*np.abs(wvf.T)**2)\
+        /(np.matmul(np.conjugate(wvf.T),wvf))
+    else:
+        O_l= np.sum(np.matmul((np.abs(wvf.T)**2),mat))\
+        /(np.matmul(np.conjugate(wvf.T),wvf))
+    return O_l
+
+ppsi=psi_init(L,hidden_layer_sizes,len(evals)*L,'exponential')
+original_net=copy.deepcopy(ppsi)
+
+s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.float)
+new_s=ppsi.Autoregressive_pass(s0,evals)
+s=ppsi.Autoregressive_pass(new_s,evals)
+
+[H_nn, H_b]=ppsi.O_local(nn_interaction,s.numpy()),ppsi.O_local(b_field,s.numpy())
+E_loc=np.sum(H_nn+H_b,axis=1)
+E0=np.real(np.mean(E_loc))
+
+#autograd_hacks.add_hooks(ppsi.real_comp)
+#outr=ppsi.real_comp(s)
+#outr.mean().backward()
+#autograd_hacks.compute_grad1(ppsi.real_comp)
+#
+#mult=torch.tensor(np.real(2*(np.conj(E_loc)-np.conj(E0))/psi0),dtype=torch.float)
+
+ppsi.real_comp.zero_grad()
+
+pars1=list(ppsi.real_comp.parameters())
+
+dw=0.0001 # sometimes less accurate when smaller than 1e-3
+with torch.no_grad():
+    pars1[0][0][0]=pars1[0][0][0]+dw
+
+original_net.Autoregressive_pass(torch.tensor(s2,dtype=torch.float),evals)
+wvf0=original_net.wvf
+ppsi.Autoregressive_pass(torch.tensor(s2,dtype=torch.float),evals)
+wvf1=ppsi.wvf
+E_tot0=np.matmul(np.matmul(np.conjugate(wvf0.T),H_tot),wvf0)/(np.matmul(np.conjugate(wvf0.T),wvf0))
+E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conjugate(wvf1.T),wvf1))
+dif=(E_tot1-E_tot0)/dw
+
+# Here calculate the base (unaltered) equivalent expression using O_local 
+[H_nn_ex, H_b_ex]=original_net.O_local(nn_interaction,s2),original_net.O_local(b_field,s2)
+E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
+
+# Get my list of vis
+outc=original_net.complex_out(torch.tensor(s2,dtype=torch.float))
+
+# Get my psi_omega1 gradients (in pars[ii].grad1)
+if not hasattr(original_net.real_comp,'autograd_hacks_hooks'):             
+    autograd_hacks.add_hooks(original_net.real_comp)
+outr=original_net.real_comp(torch.tensor(s2,dtype=torch.float))
+outr.mean().backward()
+autograd_hacks.compute_grad1(original_net.real_comp)
+autograd_hacks.clear_backprops(original_net.real_comp)
+pars=list(original_net.real_comp.parameters())
+
+Ok=np.zeros([np.shape(s2)[0]],dtype=complex)
+# Accumulate O_omega1 over lattice sites (also have to see which s where used)
+for ii in range(0, L): # loop over lattice sites
+    if ii==L: nlim=nout+1 # conditions for slicing. Python doesn't take slice
+    else: nlim=nout       # if nout/L=int, so for ii=L, we need (nout+1)/L for 
+    vi=outc[:,ii:nlim:L]   
+    si=s2[:,ii] # the input/chosen si (maybe what I'm missing from prev code/E calc)
+    exp_vi=np.exp(vi) # unnorm prob of evals 
     
-    # normalized probability/wavefunction
-    vi=outr[:,ii]
-    vi2=outr[:,ii+1]
-    exp_vi=torch.exp(vi) # unnorm prob of either 1 or 0 
-    exp_vi2=torch.exp(vi2) 
-    norm_const=torch.sqrt((torch.pow(torch.abs(exp_vi),2)+\
-                           torch.pow(torch.abs(exp_vi2),2)))
-    psi1=exp_vi/norm_const
-    psi2=(exp_vi2)/norm_const
+    # pars[0] as we're just looking at a change in 0
+    grad0=pars[0].grad1[:,:,0].numpy() # or grad1[:,:,ii]?
+    grad0=grad0[:,0] # only comparing to the 0th derivative
     
-    born_psi1=torch.pow(torch.abs(psi1),2)
-    born_psi2=torch.pow(torch.abs(psi2),2)
-    
-    # satisfy the normalization condition?
-    assert torch.all(born_psi1+born_psi2-1<1e-6), "Psi not normalized correctly"
-
-    # Now let's sample from the binary distribution
-    rands=torch.rand(N_samples)
-    
-    new_s[:,round(ii/2)]=torch.ones([N_samples])+2*(rands<=born_psi1)*evals[0] 
-                        #+(rands>born_psi2)*evals[1]
+    # calculating the normalization term
+    norm_term=np.sum((vi*np.power(exp_vi,2)/np.power(np.abs(exp_vi),3)),1)*grad0
+   
+    temp_Ok=np.zeros([np.shape(s2)[0]],dtype=complex)
+    for jj in range(len(evals)): 
         
-    # Accumulating Psi
-    psi_s=(rands<born_psi1)*1*psi1+(rands>born_psi2)*1*psi2
-    Ppsi=Ppsi*psi_s
-
-
+        selection=(si==evals[jj]) # which s were sampled 
+                                #(which indices correspond to the si)
+        sel1=selection*1
         
+        # For each eval/si, we must select only the subset vi(si) 
+        temp_Ok[:]+=(sel1*vi[:,jj]*grad0-norm_term)
+    Ok+=temp_Ok # manual sum over lattice sites ii=0->N
+
+deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
+Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))
+
+print('\n Expecation val deriv: ', deriv_E0, '\n vs numerical wvf energy diff: ', dif)
+
+'''#### Test model in Ppsi Object Construction & with Methods  ####'''
+
+# Test Autograd_hacks (works with modification I added that applies masks)
+ppsi=psi_init(L,hidden_layer_sizes,nout,'euler')
+if not hasattr(ppsi.real_comp,'autograd_hacks_hooks'):             
+    autograd_hacks.add_hooks(ppsi.real_comp)
+outr=ppsi.real_comp(s0)
+outr.mean().backward()
+autograd_hacks.compute_grad1(ppsi.real_comp) #computes grad per sample for all samples
+autograd_hacks.clear_backprops(ppsi.real_comp)
+p_r=list(ppsi.real_comp.parameters())
+
+for param in p_r:
+    print(torch.max(param.grad-param.grad1.mean(0)))
+
+# test SR
+E_loc=np.sum(H_nn+H_b,1)
+ppsi.SR(s0,E_loc)
+# Also will need some adjustments
+# The m=outr(s) and complex_out(s) are no longer N_samples,1. Need to add
+# method that converts ppsi.real_model(s) to conditional psi coef list when 
+# the model is autoregressive. (similarly for complex_out).
+

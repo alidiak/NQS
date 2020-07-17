@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from NQS_pytorch import Op, Psi, O_local
+from NQS_pytorch import Op, Psi, kron_matrix_gen
 import autograd_hacks
 
 # system parameters
@@ -39,14 +39,29 @@ for i in range(L):  # Specify the sites upon which the operators act
     b_field.add_site([i])
     nn_interaction.add_site([i,(i+1)%L])
 
+# this tool creates the full Hamiltonian and is used for energy comparison 
+# practical in use of L<=16, otherwise memory requirements can become an issue
+op_list=[] 
+for ii in range(2): # make sure to change to match Hamiltonian entered above
+    op_list.append(sigmaz)
+H_szsz=-J*kron_matrix_gen(op_list,len(evals),L,'periodic').toarray()
+
+op_list2=[]
+op_list2.append(sigmax)
+H_sx=b*kron_matrix_gen(op_list2,len(evals),L,'periodic').toarray()
+
+H_tot=H_szsz+H_sx
+
+min_E=np.min(np.linalg.eigvals(H_tot))
+
 '''##### Define Neural Networks and initialization funcs for psi  #####'''
 
 def psi_init(L, H=2*L, Form='euler'):
-    toy_model=nn.Sequential(nn.Linear(L,H),nn.Sigmoid(), 
-                       nn.Linear(H,1))#,nn.Sigmoid()) 
-    H2=round(H/2)
-    toy_model2=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),
-                     nn.Linear(H2,1))#,nn.Sigmoid()) 
+    toy_model=nn.Sequential(nn.Linear(L,H),nn.Tanh(), 
+               nn.Linear(H,1))#,nn.ReLU())#,nn.Linear(H,1),nn.Tanh())
+    H2=H #round(H/2)
+    toy_model2=nn.Sequential(nn.Linear(L,H2),nn.Tanh(),
+        nn.Linear(H2,1),nn.Tanh())#,nn.Linear(H,1),nn.Tanh())#,nn.Sigmoid()) 
 
     ppsi=Psi(toy_model,toy_model2, L, form=Form)
     
@@ -61,13 +76,13 @@ ppsi=psi_init(L,2*L,'vector')  # without mult, initializes params randomly
 sb=ppsi.sample_MH(burn_in,spin=0.5)
 s=torch.tensor(ppsi.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float)
 
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi),O_local(b_field,s.numpy(),ppsi)
+[H_nn, H_b]=ppsi.O_local(nn_interaction,s.numpy()),ppsi.O_local(b_field,s.numpy())
 E_loc=np.sum(H_nn+H_b,axis=1)
 lambduh=1
                        
 '''#### Defining a more succinct algorithm to perform real and imag sep ####'''
 
-def SR(ppsi,s,E_loc, lambduh=1, cutoff=1e-8): 
+def SR(ppsi,s,E_loc, lambduh=1):#, cutoff=1e-8): 
     
     E0=np.real(np.mean(E_loc))
 
@@ -103,36 +118,29 @@ def SR(ppsi,s,E_loc, lambduh=1, cutoff=1e-8):
             
         for param in pars:
             with torch.no_grad():
-                if len(param.size())==2:#different mat mul rules depending on mat shape
-                    ein_str="i,ijk->ijk"
-                elif len(param.size())==1:
-                    ein_str="i,ik->ik"
-                if len(param.size())>1:
-                    if param.size(1)>param.size(0): # pytorch flips matrix pattern sometimes
-    # have to manually flip it back. (else get S=scalar for Nx1 matrix xforms-can't be right)
-                        param.grad1=param.grad1.view(param.grad1.size(0),param.size(1),param.size(0))
-                Ok=np.einsum(ein_str,m,param.grad1.numpy())
-                if len(np.shape(Ok))==2:
-                    Ok=Ok[:,:,None] 
-    # Vector bias values do not agree with original method if this is not present
-    # When present though, returns values similar in order to the other param grad values...
-                Exp_Ok=np.mean(Ok,0) # conj(mean)=mean(conj)
-    #T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
-                T1=np.einsum("kni,imk->nm",np.conj(Ok),Ok.T)/N_samples
-            # These are methods are equivalent! Good sanity check (einsum more versitile)
-                St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
-     # In NKT, cutoff of 1e-10 is used for S before inverting - inc. numerical stability?
-     # if diagS< cutoff, S(i,i)=1 and s.row=s.col=0. 
-                St[St<cutoff]=0
-                l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
-                S_inv=torch.tensor(np.linalg.pinv(St+l_reg),dtype=torch.float) # S^-1 term with reg
-                force=torch.einsum(ein_str,torch.tensor(np.real(2*E_arg*m)\
-                ,dtype=torch.float),param.grad1).mean(0) # force/DE term
+                par_size=param.size() # record original param shape for reshaping
+                Ok=np.einsum("i,ik->ik",m,param.grad1.view([N_samples,-1]).numpy())
+                Exp_Ok=np.mean(Ok,0)[:,None] # gives another axis, necessary for matmul
+        #        T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
+                T1=np.einsum("kn,mk->nm",np.conj(Ok),Ok.T)/N_samples
+                # These are methods are equivalent! Good sanity check (einsum more versitile)
+#                S=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+                # folowing same reg/style as senior design matlab code
+                S=T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)+1e-5*np.eye(T1.shape[0],T1.shape[1]) 
+                S_inv=np.linalg.inv(S)
+#                S[S<cutoff]=0
+#                l_reg=lambduh*np.eye(S.shape[0],S.shape[1])*np.diag(S) # regulation term
+                # SVD Inversion alg
+#                [U,D,VT]=np.linalg.svd(S+l_reg)
+#                D=np.diag(1/D) # inverting the D matrix, for SVD, M'=V (D^-1) U.T = (U(D^-1)V.T).T
+#                S_inv=torch.tensor(np.matmul(np.matmul(U,D),VT).T,dtype=torch.float)
+#                S_inv=torch.tensor(np.linalg.pinv(S+l_reg),dtype=torch.float) # S^-1 term with reg
+                force=torch.einsum("i,ik->ik",torch.tensor(np.real(2*E_arg*m)\
+                ,dtype=torch.float),param.grad1.view([N_samples,-1])).mean(0) # force/DE term
                 # Compute SR 'gradient'
-                if len(force.size())==1:  # deal with .mm issues when vector Mx1
-                    param.grad=torch.mm(S_inv,force[:,None]).view(param.size()).detach() 
-                else:
-                    param.grad=torch.mm(S_inv,force).view(param.size()).detach()
+                param.grad=torch.tensor(np.real(np.matmul(S_inv,force[:,None]\
+                .detach().numpy())),dtype=torch.float).view(par_size).detach()   # matlab code similar
+#                param.grad=torch.mm(S_inv,force[:,None]).view(par_size).detach()
     
     return
     
@@ -150,78 +158,64 @@ def SR(ppsi,s,E_loc, lambduh=1, cutoff=1e-8):
 #    pars=list(model.parameters())
 #        
 #    for param in pars:
-#        with torch.no_grad():
-#            if len(param.size())==2:#different mat mul rules depending on mat shape
-#                ein_str="i,ijk->ijk"
-#            elif len(param.size())==1:
-#                ein_str="i,ik->ik"
-#            if len(param.size())>1:
-#                if param.size(1)>param.size(0): # pytorch flips matrix pattern sometimes
-## have to manually flip it back. (else get S=scalar for Nx1 matrix xforms-can't be right)
-#                    param.grad1=param.grad1.view(param.grad1.size(0),param.size(1),param.size(0))
-#            Ok=np.einsum(ein_str,m,param.grad1.numpy())
-#            if len(np.shape(Ok))==2:
-#                Ok=Ok[:,:,None] 
-## Vector bias values do not agree with original method if this is not present
-## When present though, returns values similar in order to the other param grad values...
-#            Exp_Ok=np.mean(Ok,0) # conj(mean)=mean(conj)
-##T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
-#            T1=np.einsum("kni,imk->nm",np.conj(Ok),Ok.T)/N_samples
-#        # These are methods are equivalent! Good sanity check (einsum more versitile)
-#            St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
-# # In NKT, cutoff of 1e-10 is used for S before inverting - inc. numerical stability?
-# # if diagS< cutoff, S(i,i)=1 and s.row=s.col=0. 
-#            St[St<cutoff]=0
-#            l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
-#            S_inv=torch.tensor(np.linalg.pinv(St+l_reg),dtype=torch.float) # S^-1 term with reg
-#            force=torch.einsum(ein_str,torch.tensor(np.real(2*E_arg*m)\
-#            ,dtype=torch.float),param.grad1).mean(0) # force/DE term
+#        with torch.no_grad():      
+#            par_size=param.size() # record original param shape for reshaping
+#            Ok=np.einsum("i,ik->ik",m,param.grad1.view([N_samples,-1]).numpy())
+#            Exp_Ok=np.mean(Ok,0)[:,None] # gives another axis, necessary for matmul
+#    #        T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
+#            T1=np.einsum("kn,mk->nm",np.conj(Ok),Ok.T)/N_samples
+#            # These are methods are equivalent! Good sanity check (einsum more versitile)
+#            S=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+#            S[S<cutoff]=0
+#            l_reg=lambduh*np.eye(S.shape[0],S.shape[1])*np.diag(S) # regulation term
+#            S_inv=torch.tensor(np.linalg.pinv(S+l_reg),dtype=torch.float) # S^-1 term with reg
+#            force=torch.einsum("i,ik->ik",torch.tensor(np.real(2*E_arg*m)\
+#            ,dtype=torch.float),param.grad1.view([N_samples,-1])).mean(0) # force/DE term
 #            # Compute SR 'gradient'
-#            if len(force.size())==1:  # deal with .mm issues when vector Mx1
-#                param.grad=torch.mm(S_inv,force[:,None]).view(param.size()).detach() 
-#            else:
-#                param.grad=torch.mm(S_inv,force).view(param.size()).detach()
+#            param.grad=torch.mm(S_inv,force[:,None]).view(par_size).detach() 
 #    
 #    return
-    
+
 ''' ############### Explicit Testing of the SR func ####################### '''
 
-ppsi=psi_init(L,2*L,'euler')  # without mult, initializes params randomly
+ppsi=psi_init(L,L,'real')  # without mult, initializes params randomly
+lambduh0, b, lambduh_min = 100, 0.9, 1e-4
+lr=0.1; 
 
-N_iter=300
+N_iter=200
 E=np.zeros([N_iter,1])
 
 for kk in range(N_iter):
 
+    start = time.time()
     sb=ppsi.sample_MH(burn_in,spin=0.5)
     s=torch.tensor(ppsi.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float)
+    end = time.time()
+    print(end - start) # Seems that the sampling is the real bottleneck
     
-    [H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi),O_local(b_field,s.numpy(),ppsi)
+    [H_nn, H_b]=ppsi.O_local(nn_interaction,s.numpy()),ppsi.O_local(b_field,s.numpy())
     E_loc=np.sum(H_nn+H_b,axis=1)
     E[kk] = np.mean(E_loc)
     
-    start = time.time()
-    SR(ppsi,s,E_loc)
-    end = time.time()
-    print(end - start)
+    l_iter=lambduh0*b
+    l=max(l_iter,lambduh_min)
+    SR(ppsi,s,E_loc, lambduh=l)
+    
+#    lr=lr*0.99
+    ppsi.apply_grad(lr)
 
-    ppsi.apply_grad(lr=0.1)
-
-# SR definitely takes far longer than SGD
+# SR definitely takes longer than SGD
+# This all samples at once calculation is many orders of magn. faster than loop
+# The sampling is the real compuational bottleneck (at low L, at least)
 
 plt.figure
 plt.plot(range(N_iter),E)
+plt.axhline(y=min_E,color='r',linestyle='-')
 plt.xlabel('Iteration number')
 plt.ylabel('Energy')
 
 
-
-
-
-
-
-
-''' ### First Matrix Implementation ###'''
+'''### First Matrix Implementation (Useful for explicit testing, coding) ###'''
 
 #ppsi=psi_init(L,2*L,'vector')  # without mult, initializes params randomly
 #
@@ -293,6 +287,26 @@ plt.ylabel('Energy')
 #            param.grad=torch.mm(S_inv,force[:,None]).view(param.size()).detach() 
 #        else:
 #            param.grad=torch.mm(S_inv,force).view(param.size()).detach()
+#
+#
+''' ############ The Corrected Alternative ################### '''
+#
+#for param in p_r:
+#    with torch.no_grad():      
+#        par_size=param.size() # record original param shape for reshaping
+#        Ok=np.einsum("i,ik->ik",m_r,param.grad1.view([N_samples,-1]).numpy())
+#        Exp_Ok=np.mean(Ok,0)[:,None] # gives another axis, necessary for matmul
+##        T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
+#        T1=np.einsum("kn,mk->nm",np.conj(Ok),Ok.T)/N_samples
+#        # These are methods are equivalent! Good sanity check (einsum more versitile)
+#        St=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+#        l_reg=lambduh*np.eye(St.shape[0],St.shape[1])*np.diag(St) # regulation term
+#        S_inv=torch.tensor(np.linalg.pinv(St+l_reg),dtype=torch.float) # S^-1 term with reg
+#        force=torch.einsum("i,ik->ik",torch.tensor(np.real(2*E_arg*m_r)\
+#        ,dtype=torch.float),param.grad1.view([N_samples,-1])).mean(0) # force/DE term
+#        # Compute SR 'gradient'
+#        param.grad=torch.mm(S_inv,force[:,None]).view(par_size).detach() 
+#
 #
 #for param in p_i:
 #    with torch.no_grad():

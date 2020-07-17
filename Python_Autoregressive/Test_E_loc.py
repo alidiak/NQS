@@ -9,7 +9,7 @@ Created on Tue May 12 14:42:29 2020
 import torch
 import torch.nn as nn
 import numpy as np
-from NQS_pytorch import Op, O_local, Psi, kron_matrix_gen
+from NQS_pytorch import Op, Psi, kron_matrix_gen
 import itertools
 
 '''
@@ -48,17 +48,20 @@ H2=2*L
 imag_net=nn.Sequential(nn.Linear(L,1))#,nn.Sigmoid()) #,nn.Linear(H2,1),nn.Sigmoid()) 
 #imag_net=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),nn.Linear(H2,1),nn.Sigmoid()) 
 
+dat_type=torch.double
+
 # Test complex wavefunction object construction with modulus and angle
-ppsi=Psi(real_net,imag_net, L, form='euler')
-# OR
-#ppsi=Psi(real_net,imag_net, L, form='vector')
+#ppsi=Psi(real_net,imag_net, L, form='euler',dtype=dat_type)
+#ppsi=Psi(real_net,imag_net, L, form='vector',dtype=dat_type)
+#ppsi=Psi(real_net,imag_net, L, form='exponential',dtype=dat_type)
+ppsi=Psi(real_net,0, L, form='real',dtype=dat_type)
 
 '''##################### Testing O_local with L=3 #########################'''
 spin=0.5    # routine may not be optimized yet for spin!=0.5
 evals=2*np.arange(-spin,spin+1)
 s=np.array(list(itertools.product(evals,repeat=L))) # each spin permutation
 
-wvf=ppsi.complex_out(torch.tensor(s,dtype=torch.float))
+wvf=ppsi.complex_out(torch.tensor(s,dtype=dat_type))
 
 # make the list of operators that act on neighbors
 op_list=[]
@@ -79,8 +82,8 @@ E_tot=np.matmul(np.matmul(np.conjugate(wvf.T),H_tot),wvf)/(np.matmul(np.conjugat
 
 N_samples=10000
 sn=ppsi.sample_MH(N_samples,spin=0.5)
-H_nn=O_local(nn_interaction,sn,ppsi)
-H_b=O_local(b_field,sn,ppsi)
+H_nn=ppsi.O_local(nn_interaction,sn)
+H_b=ppsi.O_local(b_field,sn)
 
 print('For psi= \n', wvf, '\n\n the energy (using exact H) is: ', E_tot, '\n while that ' \
       'predicted with the O_local function is: ', np.sum(np.mean(H_b+H_nn,axis=0)), \
@@ -98,7 +101,7 @@ sxsx=Op(np.kron(sigmax, sigmax))
 for i in range(L):  # Specify the sites upon which the operators act
     sxsx.add_site([i,(i+1)%L])
 
-H_sxsx=O_local(sxsx,sn,ppsi)
+H_sxsx=ppsi.O_local(sxsx,sn)
 
 op_list=[]
 for ii in range(2):
@@ -113,8 +116,8 @@ print('\n\n the energy of Sx*Sx (using exact H) is: ', E_exact, '\n with O_l it 
 
 ''' Ensuring that <psi|H|psi> = \sum_s |psi(s)|^2 e_loc(s)   '''
 
-H_sxsx_ex=O_local(sxsx,s,ppsi)
-H_sx_ex=O_local(b_field,s,ppsi)
+H_sxsx_ex=ppsi.O_local(sxsx,s)
+H_sx_ex=ppsi.O_local(b_field,s)
 O_loc_analytic= np.sum(np.matmul((np.abs(wvf.T)**2),(H_sxsx_ex+H_sx_ex)))\
  /(np.matmul(np.conjugate(wvf.T),wvf))
 

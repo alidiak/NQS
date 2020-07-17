@@ -30,13 +30,25 @@ class Op:
 '''###################### Complex Psi ######################################'''
 # can change all s to self.samples if running optimization
 class Psi:
-    
-    def __init__(self,real_comp,imag_comp,L,form='euler', dtype=torch.float):
+    ''' potential improvement of the above class would be to make s a property 
+    (less re-entering of s). '''
+    def __init__(self,real_comp,imag_comp,L, form='euler', dtype=torch.float,
+                 autoregressive=False):
         # options for form are 'euler' or 'vector' - corresponding to 2 forms 
         # of complex number notation
         self.complex=0
         self.L=L
         self.samples=0
+        self.form=form
+        self.re=False
+        if self.form.lower()=='real': self.re=True # no imag_comp if net is real
+        
+        # Boolean of the class specifying if it is an autoregressive model
+        self.autoregressive=autoregressive # default is false
+        if self.autoregressive: # Adding autoregressive specific properties
+            self.wvf=0 # accumulated psi
+        
+        # Code for adjusting class to different datatypes
         if isinstance(dtype,str):
             if dtype.lower()=='double':
                 self.dtype=torch.double
@@ -45,16 +57,18 @@ class Psi:
             self.dtype=dtype
         if self.dtype==torch.double:
             self.real_comp=real_comp.double() # converts model params to double acc.
-            self.imag_comp=imag_comp.double()
+            if not self.re: self.imag_comp=imag_comp.double()
+            self.complextype=np.complex128
         else:
             self.real_comp=real_comp
-            self.imag_comp=imag_comp
-        self.form=form
-        
+            if not self.re: self.imag_comp=imag_comp
+            self.complextype=np.complex64
+                    
     # Method to return the complex number specified by the state of the 
     # 2 ANNs real_comp and imag_comp and an input state s
-    def complex_out(self, s):
-        self.complex=np.zeros(s.size(0),dtype=np.complex128) # complex number for each sample
+    def complex_out(self, s): # complex number for each sample
+        if not self.form.lower()=='real':
+            self.complex=np.zeros(s.size(0),dtype=self.complextype)
         if self.form.lower()=='euler':
             self.complex=self.real_comp(s).detach().numpy()*    \
             np.exp(1j*self.imag_comp(s).detach().numpy())
@@ -64,6 +78,8 @@ class Psi:
         elif self.form.lower()=='exponential':
             self.complex=np.exp(self.real_comp(s).detach().numpy()+    \
             1j*self.imag_comp(s).detach().numpy())
+        elif self.form.lower()=='real':
+            self.complex=self.real_comp(s).detach().numpy()
         else:
             raise Warning('Specified form', self.form, ' for complex number is'\
             ' ambiguous, use either "euler": real_comp*e^(i*imag_comp), "vector":'\
@@ -74,12 +90,129 @@ class Psi:
             np.exp(1j*self.imag_comp(s).detach().numpy())
         return self.complex
 
+    '''############################ O_local #######################################
+    Now find O_local where O is an arbitrary operator acting on sites entered. This 
+    function returns the O_local operator summed over the 'allowed' transitions 
+    between the given input spin s and any non-zero transition to spin config s'. 
+    This operator also depends upon the current wavefunction psi. '''
+    def O_local(self, operator, s): 
+        
+        # Testing if it is a Hamiltonian object
+    #    if hasattr(operator,'Op_list'):
+    #        N_ops=len(operator.Op_list)
+    #    else:
+    #        N_ops=1
+    #        
+        #if not np.all(np.conjugate(np.transpose(operator.matrix))==operator.matrix):
+        #    raise Warning('Operator matrix ', operator.matrix, 'is not Hermitian,'\
+        #                  ' Observable may be non-real and unphysical')
+                     # using CUDA devices could potentially accelerate this func?
+        sites=operator.sites.copy()
+        
+        [n_sites,op_span]= np.shape(sites) # get lattice list length and operator span
+                                            # former is often equal to L (lat size) if applied to all sites
+        [N_samples,L]=np.shape(s)  # Get the number of samples and lattice size from samples
+            
+        # For now, assuming we are working in the Sz basis with spin=1/2
+        spin=0.5 # presumambly will be entered by the user in later versions
+        dim = int(2*spin+1)
+        evals=2*np.arange(-spin,spin+1)
+        # multiplied by 2 simply because integers are easier to work with
+        
+        op_size=np.log((np.shape(operator.matrix)[0]))/np.log(dim)
+        if not op_size==op_span:
+            raise ValueError('Operator size ', op_size, ' does not match the number' \
+                             ' of sites entered ', op_span, 'to be acted upon')
+        
+        O_loc=np.zeros([N_samples,L],dtype=self.complextype) 
+        #this construction allows us to get local expectation vals
+        # and the energy for each sample (which we can use to backprop)
+        
+        # cycle through the sites and apply each operator to state s_i (x s_i+1...)
+        for i in range(n_sites):
+            
+            s_prime=s.copy() # so it's a fresh copy each loop
+            
+            # Set up spin config representation in Sz basis for just the acted upon spins
+            # need to generalize for arbitrary spin
+            sz_basis=np.zeros([N_samples,op_span,dim])
+            s_loc=s[:,sites[i]]
+            # can iterate over this for spin!=0.5. use evals
+            sz_basis[np.where(s_loc==1)[0],np.where(s_loc==1)[1],:]=np.array([1,0]) 
+            sz_basis[np.where(s_loc==-1)[0],np.where(s_loc==-1)[1],:]=np.array([0,1])
+            
+            if op_span>1: # extend the size of the basis for multi-site operators
+                basis=sz_basis[:,0,:]
+                for j in range(1,op_span): 
+                    basis=np.einsum('nk,nl->nkl',basis,sz_basis[:,j,:]).reshape(basis.shape[0],-1)
+                    # einstein summation func, forces kron product over 2nd axis by 
+                    # by taking matching inputs from the nth col, avoids kron over samples
+                    # cycle through the states acted on by the multi-site operator
+            else:
+                basis=sz_basis[:,0,:]
+                
+            # S[sites[i]] transformed by Op still in extended basis
+            # Should not matter which side the operator acts on as Op must be hermitian
+            # as we act on the left here, 
+            xformed_state=np.squeeze(np.matmul(basis,operator.matrix)) 
+            
+    #        if np.all((basis>0)==(np.abs(xformed_state)>0)):
+    #            # can skip changing s', nothing's changed in the basis
+    #            basis[basis==0]=1 # just doing this so that there's no division by 0
+    #            div=xformed_state/basis
+    #            multiplier=div[div>0] 
+    #            # returns all of the differences in magnitude of the otherwise unchanged basis state
+    #            pass
+    #        else:
+    
+            # just so the alg can handle single sample input. adds a singleton dim
+            if len(xformed_state.shape)==1:
+                xformed_state=xformed_state[None,:]
+    
+            ## Generating all possible permutations of the local spins
+            perms=np.array(list(itertools.product(evals,repeat=op_span)))
+            
+            # do a loop over all of the possible permutations
+            for kk in range(len(perms)): # xformed_state.shape[1]
+                
+                # change the local spins in s' for each config
+                s_prime[:,sites[i]]=perms[-(kk+1)]
+                # -(kk+1) is used because the ordering is opposite of how the 
+                # slicing is organized. Ex, -1,-1 corresponds to the last 
+                # slice (0,0,0,1) and 1,1 to the first (1,0,0,0) with the 
+                # 1 state = (1,0) and -1 state = (0,1) convention.
+                
+                if self.autoregressive:
+                    self.Autoregressive_pass(torch.tensor(s_prime,\
+                    dtype=self.dtype),evals)
+                    wvf_prime=self.wvf
+                    self.Autoregressive_pass(torch.tensor(s,\
+                    dtype=self.dtype),evals)
+                    log_psi_diff=np.log(wvf_prime)-np.log(self.wvf)
+                    O_loc[:,i]+= xformed_state[:,kk]*np.exp(log_psi_diff)
+                elif self.form.lower()=='real': # log sensitive when real
+                    psi_div=self.complex_out(torch.tensor(s_prime,\
+                    dtype=self.dtype)).flatten()/self.complex_out(\
+                    torch.tensor(s,dtype=self.dtype)).flatten()
+                    O_loc[:,i]+= xformed_state[:,kk]*psi_div
+                else:
+                    log_psi_diff=np.log(self.complex_out(torch.tensor(s_prime,\
+                    dtype=self.dtype)).flatten())-np.log(self.complex_out(\
+                    torch.tensor(s,dtype=self.dtype))).flatten()
+                    O_loc[:,i]+= xformed_state[:,kk]*np.exp(log_psi_diff)
+                # each slice of the transformed state acts as a multiplier to 
+                # its respective local spin configuration state
+                    
+        return O_loc
+
+    ''' #################### OPTIMIZATION METHODS ##########################'''
+    
     '''##################### Energy Gradient ############################'''
     ''' This method will apply the energy gradient to each ANN network param for 
     a given form of Psi. It does simple gradient descent (no SR or anything).
     It does so given an E_local, Energy E, and wavefunc Psi over sample set s.'''
 
-    def energy_gradient(self,s,E_loc,E=None): # add Pytorch optimizer) (fixed lr for now)
+    def energy_gradient(self, s, E_loc, E=None): # add Pytorch optimizer) (fixed lr for now)
         
         if E is None:
             E=np.mean(E_loc)
@@ -89,16 +222,20 @@ class Psi:
         diff=(E_loc-E)
         
         self.real_comp.zero_grad()
-        self.imag_comp.zero_grad()
+        if not self.re: self.imag_comp.zero_grad()
         # should be the simpler form to apply dln(Psi)/dw_i
-        if self.form.lower()=='euler' or self.form.lower()=='exponential':
+        if self.form.lower()=='real':
+            outr = self.real_comp(s).flatten()
+            mult=torch.tensor(np.real(2*diff),dtype=self.dtype)
+            (outr.log()*mult).mean().backward()
+        elif self.form.lower()=='euler' or self.form.lower()=='exponential':
             
             outr = self.real_comp(s).flatten()
             outi = self.imag_comp(s).flatten()
             
             # each form has a slightly different multiplication form
             # MODULUS
-            mult=torch.tensor(np.real(2*diff),dtype=torch.float)
+            mult=torch.tensor(np.real(2*diff),dtype=self.dtype)
             if self.form.lower()=='euler':
                 (outr.log()*mult).mean().backward()
             elif self.form.lower()=='exponential':
@@ -107,7 +244,7 @@ class Psi:
             # which corresponds to dpsi_real(s)/dpars. 
             
             # ANGLE
-            mult = torch.tensor(2*np.imag(-E_loc),dtype=torch.float)
+            mult = torch.tensor(2*np.imag(-E_loc),dtype=self.dtype)
             (mult*outi).mean().backward()
             
         # Although the speed difference is not significant, the above is still 
@@ -147,14 +284,14 @@ class Psi:
                 elif len(param.size())==1:
                     ein_str="i,ik->ik"
                 param.grad=torch.einsum(ein_str,torch.tensor(np.real(m)\
-                    ,dtype=torch.float),param.grad1).mean(0)
+                    ,dtype=self.dtype),param.grad1).mean(0)
             for param in p_i: # dPsi here is 1j*dPsi of real
                 if len(param.size())==2:
                     ein_str="i,ijk->ijk"
                 elif len(param.size())==1:
                     ein_str="i,ik->ik"
                 param.grad=torch.einsum(ein_str,torch.tensor(np.real(1j*m)\
-                    ,dtype=torch.float),param.grad1).mean(0)
+                    ,dtype=self.dtype),param.grad1).mean(0)
           
             # clear backprops_list for next run
             autograd_hacks.clear_backprops(self.real_comp)
@@ -162,21 +299,27 @@ class Psi:
             
         return 
 
-    def SR(self,s,E_loc, lambduh=1):#, cutoff=1e-8): 
+    '''################### Stochatic Reconfiguation ########################'''
+
+    def SR(self, s, E_loc, lambduh=1):#, cutoff=1e-8): 
         
         E0=np.real(np.mean(E_loc))
-    
+        N_samples=s.shape[0]
+        
+#        if self.autoregressive:
+            
         if self.form.lower()=='vector':
             if np.all(self.complex==0): 
                 self.complex_out(s)
             m_r=(1/self.complex).squeeze()
             m_i=1j*m_r
-        elif self.form.lower()=='euler' or self.form.lower()=='exponential':
-            if self.form.lower()=='euler':
+        elif self.form.lower()=='euler' or self.form.lower()=='exponential'\
+             or self.form.lower()=='real':
+            if self.form.lower()=='euler' or self.form.lower()=='real':
                 m_r=1/self.real_comp(s).detach().numpy().squeeze()
             else:
-                m_r=(np.ones([s.shape[0],1])).squeeze()
-            m_i=(np.ones([s.shape[0],1])*1j).squeeze()
+                m_r=(np.ones([N_samples,1])).squeeze()
+            m_i=(np.ones([N_samples,1])*1j).squeeze()            
             
         E_arg=(np.conj(E_loc)-np.conj(E0))
         
@@ -187,7 +330,6 @@ class Psi:
                 model=self.imag_comp; m=m_i
                 
             model.zero_grad()
-            N_samples=s.shape[0]
             
             if not hasattr(model,'autograd_hacks_hooks'):             
                 autograd_hacks.add_hooks(model)
@@ -205,43 +347,56 @@ class Psi:
             #        T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
                     T1=np.einsum("kn,mk->nm",np.conj(Ok),Ok.T)/N_samples
                     # These are methods are equivalent! Good sanity check (einsum more versitile)
-                    S=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)) # the S+c.c. term
+                    S=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T))+1e-5*np.eye(T1.shape[0],T1.shape[1]) # the S+c.c. term
+                    # folowing same reg/style as senior design matlab code
+#                    S=T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)+1e-5*np.eye(T1.shape[0],T1.shape[1]) 
+                    S_inv=np.linalg.inv(S)
 #                    S[S<cutoff]=0
-                    l_reg=lambduh*np.eye(S.shape[0],S.shape[1])*np.diag(S) # regulation term
+#                    l_reg=lambduh*np.eye(S.shape[0],S.shape[1])*np.diag(S) # regulation term
                     # SVD Inversion alg
 #                    [U,D,VT]=np.linalg.svd(S+l_reg)
 #                    D=np.diag(1/D) # inverting the D matrix, for SVD, M'=V (D^-1) U.T = (U(D^-1)V.T).T
-#                    S_inv=torch.tensor(np.matmul(np.matmul(U,D),VT).T,dtype=torch.float)
-                    S_inv=torch.tensor(np.linalg.pinv(S+l_reg),dtype=torch.double) # S^-1 term with reg
+#                    S_inv=torch.tensor(np.matmul(np.matmul(U,D),VT).T,dtype=self.dtype)
+#                    S_inv=torch.tensor(np.linalg.pinv(S+l_reg),dtype=self.dtype) # S^-1 term with reg
                     force=torch.einsum("i,ik->ik",torch.tensor(np.real(2*E_arg*m)\
-                    ,dtype=torch.double),param.grad1.view([N_samples,-1])).mean(0) # force/DE term
+                    ,dtype=self.dtype),param.grad1.view([N_samples,-1])).mean(0) # force/DE term
                     # Compute SR 'gradient'
-                    param.grad=torch.mm(S_inv,force[:,None]).view(par_size).detach() 
-        
+                    param.grad=torch.tensor(np.real(np.matmul(S_inv,force[:,None]\
+                    .detach().numpy())),dtype=self.dtype).view(par_size).detach() 
+#                    param.grad=torch.mm(S_inv,force[:,None]).view(par_size).detach() 
+            
+            # exits for loop so it is only applied to real comp
+            if self.form.lower()=='real':
+                break 
+            
         return
 
-
+    '''####### Apply the gradient generated from SR or Grad. Descent ########'''
+    ''' Potential improvement- optimization routines for lr (Adam,momentum, pytorch optimizers?)'''
     def apply_grad(self, lr=0.03):
         
         params_r=list(self.real_comp.parameters()) # get the parameters
-        params_i=list(self.imag_comp.parameters())    
+        if not self.re: params_i=list(self.imag_comp.parameters())    
         
         # apply the Energy gradient descent
-        if len(params_r)==len(params_i):
-            with torch.no_grad():
-                for ii in range(len(params_r)):
-                    params_r[ii] -= lr*params_r[ii].grad 
-                    params_i[ii] -= lr*params_i[ii].grad
-        else:
-            with torch.no_grad():
-                for param in params_r:
-                    param -= lr*param.grad
+#        if len(params_r)==len(params_i) and not self.re:
+#            with torch.no_grad():
+#                for ii in range(len(params_r)):
+#                    params_r[ii] -= lr*params_r[ii].grad 
+#                    params_i[ii] -= lr*params_i[ii].grad
+#        else:
+        with torch.no_grad():
+            for param in params_r:
+                param -= lr*param.grad
+            if not self.re:
                 for param in params_i:
                     param -= lr*param.grad
         
         return
-
-    '''###################### Sampling function ################################'''
+    
+    ''' #################### SAMPLING METHODS ##########################'''
+    
+    '''#################### MH Sampling function ############################'''
     def sample_MH(self, N_samples, spin=None, evals=None, s0=None, rot=None):
         # need either the explicit evals or the spin 
         if spin is None and evals is None:
@@ -279,12 +434,12 @@ class Psi:
             # Will have to generalize to complex vals sometime
             
             # Probabilty of the next state divided by the current
-            ln_prob=2*(np.log(np.abs(self.complex_out(torch.tensor(alt_state,dtype=torch.float))))\
-            -np.log(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=torch.float)))))
+            ln_prob=2*(np.log(np.abs(self.complex_out(torch.tensor(alt_state,dtype=self.dtype))))\
+            -np.log(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=self.dtype)))))
             # hopefully reduces potential divide by 0 errors
             prob = np.exp(ln_prob)
-#            (np.square(np.abs(self.complex_out(torch.tensor(alt_state,dtype=torch.float)))))   \
-#            /(np.square(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=torch.float)))))
+#            (np.square(np.abs(self.complex_out(torch.tensor(alt_state,dtype=self.dtype)))))   \
+#            /(np.square(np.abs(self.complex_out(torch.tensor(self.samples[n,:],dtype=self.dtype)))))
             
             A = min(1,prob) # Metropolis Hastings acceptance formula
 
@@ -295,129 +450,83 @@ class Psi:
             
         return self.samples
     
-    def Autoregressive_samples(self):
+    '''########## Autoregressive Sampling and Ppsi Gen function ############'''
+    # Begin the autoregressive sampling and Psi forward pass routine 
+    def Autoregressive_pass(self,s,evals):
         
-        assert (list(self.real_comp.parameters())[0]\
-                %list(self.real_comp.parameters())[-1])==0, \
-                "(Input dim)!=int*(Output dim), not an Autoregressive NN"
+        outc=self.complex_out(s) # the complex output given an ansatz form  
+        new_s=torch.zeros_like(s)
         
-        
-        return self.samples
-    
-'''############################ O_local #######################################
-Now find O_local where O is an arbitrary operator acting on sites entered. This 
-function returns the O_local operator summed over the 'allowed' transitions 
-between the given input spin s and any non-zero transition to spin config s'. 
-This operator also depends upon the current wavefunction psi. Psi is a Neural 
-Network object that itself is fed s. 
-'''
-
-def O_local(operator,s, psi): # potential improvement to use all tensor funcs so
-    
-    # Testing if it is a Hamiltonian object
-#    if hasattr(operator,'Op_list'):
-#        N_ops=len(operator.Op_list)
-#    else:
-#        N_ops=1
-#        
-    #if not np.all(np.conjugate(np.transpose(operator.matrix))==operator.matrix):
-    #    raise Warning('Operator matrix ', operator.matrix, 'is not Hermitian,'\
-    #                  ' Observable may be non-real and unphysical')
-                 # using CUDA devices could potentially accelerate this func?
-    sites=operator.sites.copy()
-    
-    [n_sites,op_span]= np.shape(sites) # get lattice list length and operator span
-                                        # former is often equal to L (lat size) if applied to all sites
-    [N_samples,L]=np.shape(s)  # Get the number of samples and lattice size from samples
-        
-    # For now, assuming we are working in the Sz basis with spin=1/2
-    spin=0.5 # presumambly will be entered by the user in later versions
-    dim = int(2*spin+1)
-    evals=2*np.arange(-spin,spin+1)
-    # multiplied by 2 simply because integers are easier to work with
-    
-    op_size=np.log((np.shape(operator.matrix)[0]))/np.log(dim)
-    if not op_size==op_span:
-        raise ValueError('Operator size ', op_size, ' does not match the number' \
-                         ' of sites entered ', op_span, 'to be acted upon')
-    
-    O_loc=np.zeros([N_samples,L],dtype=complex) 
-    #this construction allows us to get local expectation vals
-    # and the energy for each sample (which we can use to backprop)
-    
-    # cycle through the sites and apply each operator to state s_i (x s_i+1...)
-    for i in range(n_sites):
-        
-        s_prime=s.copy() # so it's a fresh copy each loop
-        
-        # Set up spin config representation in Sz basis for just the acted upon spins
-        # need to generalize for arbitrary spin
-        sz_basis=np.zeros([N_samples,op_span,dim])
-        s_loc=s[:,sites[i]]
-        # can iterate over this for spin!=0.5. use evals
-        sz_basis[np.where(s_loc==1)[0],np.where(s_loc==1)[1],:]=np.array([1,0]) 
-        sz_basis[np.where(s_loc==-1)[0],np.where(s_loc==-1)[1],:]=np.array([0,1])
-        
-        if op_span>1: # extend the size of the basis for multi-site operators
-            basis=sz_basis[:,0,:]
-            for j in range(1,op_span): 
-                basis=np.einsum('nk,nl->nkl',basis,sz_basis[:,j,:]).reshape(basis.shape[0],-1)
-                # einstein summation func, forces kron product over 2nd axis by 
-                # by taking matching inputs from the nth col, avoids kron over samples
-                # cycle through the states acted on by the multi-site operator
+        if len(s.shape)==2:
+            [N_samples,L]=s.shape
+            nout=outc.shape[1]
         else:
-            basis=sz_basis[:,0,:]
-            
-        # S[sites[i]] transformed by Op still in extended basis
-        # Should not matter which side the operator acts on as Op must be hermitian
-        # as we act on the left here, 
-        xformed_state=np.squeeze(np.matmul(basis,operator.matrix)) 
+            [N_samples,L]=1,s.shape[0]
+            nout=outc.shape[0]
+            outc, new_s=outc[None,:], new_s[None,:] # extra dim for calcs
         
-#        if np.all((basis>0)==(np.abs(xformed_state)>0)):
-#            # can skip changing s', nothing's changed in the basis
-#            basis[basis==0]=1 # just doing this so that there's no division by 0
-#            div=xformed_state/basis
-#            multiplier=div[div>0] 
-#            # returns all of the differences in magnitude of the otherwise unchanged basis state
-#            pass
-#        else:
-                        
-        ''' 
-        Decomposing the kronicker product back into the alternate s'
-        requires recursively splitting the vector in 1/dim, if the 1 is in  
-        the top (bottom) section, the first kronickered index is 1 (0). Keep 
-        splitting the vector untill all indices have been reassigned and a 
-        vec of size dim is left - which will be the very last site index.
-        I assume the states s are ordered where the state with eval spin is 
-        (1,0...,0), that with (0,1,0...,0) is spin-1, etc. 
-        '''
-
-        # just so the alg can handle single sample input. adds a singleton dim
-        if len(xformed_state.shape)==1:
-            xformed_state=xformed_state[None,:]
-
-        ## Generating all possible permutations of the local spins
-        perms=np.array(list(itertools.product(evals,repeat=op_span)))
+        nevals=len(evals)
         
-        # do a loop over all of the possible permutations
-        for kk in range(len(perms)): # xformed_state.shape[1]
-            
-            # change the local spins in s' for each config
-            s_prime[:,sites[i]]=perms[-(kk+1)]
-            # -(kk+1) is used because the ordering is opposite of how the 
-            # slicing is organized. Ex, -1,-1 corresponds to the last 
-            # slice (0,0,0,1) and 1,1 to the first (1,0,0,0) with the 
-            # 1 state = (1,0) and -1 state = (0,1) convention.
-            
-            with torch.no_grad():
-                log_psi_diff=np.log(psi.complex_out(torch.tensor(s_prime,\
-                dtype=torch.float)).flatten())-np.log(psi.complex_out(\
-                torch.tensor(s,dtype=torch.float))).flatten()
-                O_loc[:,i]+= xformed_state[:,kk]*np.exp(log_psi_diff)
-            # each slice of the transformed state acts as a multiplier to 
-            # its respective local spin configuration state
+        # Making sure it is an autoregressive model
+        assert nout/L==nevals,"(Output dim)!=nevals*(Input dim), not an Autoregressive NN"
                 
-    return O_loc
+        # the full Psi is a product of the conditionals, making a running product easy
+        self.wvf=np.ones([N_samples],dtype=np.complex128) 
+        
+        for ii in range(0, L): # loop over lattice sites
+            
+            if ii==L: nlim=nout+1 # conditions for slicing. Python doesn't take slice
+            else: nlim=nout       # if nout/L=int, so for ii=L, we need (nout+1)/L for 
+                                #  outc[:,nout] to be taken.
+            si=s[:,ii] # the input/chosen si (maybe what I'm missing from prev code/E calc)
+            # normalized probability/wavefunction
+            vi=outc[:,ii:nlim:L] 
+            # The MADE is prob0 for 0-nin outputs and then prob1 for 
+            # nin-2nin outputs, etc. until ((nevals-1)-nevals)*nin outputs 
+            tester=np.arange(0,nout);  # print(tester[ii:nlim:L]) # to see slices 
+            assert len(tester[ii:nlim:L])==nevals, "Network Output missing in calculation"
+            
+            exp_vi=np.exp(vi) # unnorm prob of evals 
+            norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2),1))
+            psi=np.einsum('ij,i->ij', exp_vi, 1/norm_const) # love this tool
+            
+            born_psi=np.power(np.abs(psi),2)
+            
+            # satisfy the normalization condition?
+            assert np.all(np.sum(born_psi,1)-1<1e-6), "Psi not normalized correctly"
+        
+            # Now let's sample from the binary distribution
+            rands=np.random.rand(N_samples)
+            
+            psi_s=np.zeros(N_samples, complex) # needed to accumulate Ppsi
+            checker=np.zeros(N_samples)
+            for jj in range(nevals): 
+                        
+                prev_selection=(si.numpy()==evals[jj]) # which s were sampled 
+                # psi(s), accumulate psi for the s that were used to gen samples
+                psi_s+=prev_selection*1*psi[:,jj]
+                
+                # sampling if a<born_psi, sample
+                selection=((0<=rands)*(rands-born_psi[:,jj]<=1.5e-7)) 
+                # Due to precision have to use <=1e-7 as errors will occur
+                # when comparing differences of order 1e-8. (see below check)
+                checker+=selection*1
+                
+                new_s[selection,ii]=evals[jj]
+        
+                rands=rands-born_psi[:,jj] # shifting the rands for the next sampling
+            
+            if not np.all(checker)==1: 
+                prob_ind=np.where(checker==0)
+                raise ValueError("N_samples were not sampled. error at: ", \
+                    prob_ind, 'with ', rands[prob_ind], born_psi[prob_ind,:])
+            
+#            assert np.all(checker)==1, "N_samples were not sampled"
+            
+            # Accumulating Ppsi, which is psi_1(s)*psi_2(s)...*psi_L(s)
+            self.wvf=self.wvf*psi_s
+        
+        return new_s  
 
 
 def kron_matrix_gen(op_list,D,N,bc):

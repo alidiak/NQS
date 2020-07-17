@@ -18,7 +18,7 @@ import copy
 import torch
 import torch.nn as nn
 import numpy as np
-from NQS_pytorch import Op, Psi, O_local, kron_matrix_gen
+from NQS_pytorch import Op, Psi, kron_matrix_gen
 import itertools
 import autograd_hacks # module that returns grad per sample
 import time
@@ -115,7 +115,7 @@ sb=ppsi_mod.sample_MH(burn_in,spin=0.5)
 s=torch.tensor(ppsi_mod.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float32)
 modi_params=list(ppsi_mod.imag_comp.parameters())
 
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_mod),O_local(b_field,s.numpy(),ppsi_mod)
+[H_nn, H_b]=ppsi_mod.O_local(nn_interaction,s.numpy()),ppsi_mod.O_local(b_field,s.numpy())
 E_loc=np.sum(H_nn+H_b,axis=1)
 
 angle_net=copy.deepcopy(ppsi_mod)
@@ -167,7 +167,7 @@ print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), \
       '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
 
 # Here calculate the base (unaltered) equivalent expression using O_local 
-[H_nn_ex, H_b_ex]=O_local(nn_interaction,s2,ppsi_mod),O_local(b_field,s2,ppsi_mod)
+[H_nn_ex, H_b_ex]=ppsi_mod.O_local(nn_interaction,s2),ppsi_mod.O_local(b_field,s2)
 E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
 E0 = Exp_val(E_loc,wvf0)
 
@@ -207,7 +207,7 @@ mod_net=copy.deepcopy(ppsi_mod)
 sb=ppsi_mod.sample_MH(burn_in,spin=0.5)
 s=torch.tensor(ppsi_mod.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.float32)
 
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_mod),O_local(b_field,s.numpy(),ppsi_mod)
+[H_nn, H_b]=ppsi_mod.O_local(nn_interaction,s.numpy()),ppsi_mod.O_local(b_field,s.numpy())
 E_loc=np.sum(H_nn+H_b,axis=1)
 E0=np.real(np.mean(E_loc))
 
@@ -245,7 +245,7 @@ print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc),
       '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
 
 # Here calculate the base (unaltered) equivalent expression using O_local 
-[H_nn_ex, H_b_ex]=O_local(nn_interaction,s2,ppsi_mod),O_local(b_field,s2,ppsi_mod)
+[H_nn_ex, H_b_ex]=ppsi_mod.O_local(nn_interaction,s2),ppsi_mod.O_local(b_field,s2)
 E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
     
 # get Ok on a per sample basis
@@ -281,7 +281,7 @@ s=torch.tensor(ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.flo
 
 psi0=ppsi_vec.complex_out(s).squeeze()
 
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_vec),O_local(b_field,s.numpy(),ppsi_vec)
+[H_nn, H_b]=ppsi_vec.O_local(nn_interaction,s.numpy()),ppsi_vec.O_local(b_field,s.numpy())
 E_loc=np.sum(H_nn+H_b,axis=1)
 E0=np.real(np.mean(E_loc))
 
@@ -323,7 +323,7 @@ print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc),
       '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
 
 # Here calculate the base (unaltered) equivalent expression using O_local 
-[H_nn_ex, H_b_ex]=O_local(nn_interaction,s2,real_net),O_local(b_field,s2,real_net)
+[H_nn_ex, H_b_ex]=real_net.O_local(nn_interaction,s2),real_net.O_local(b_field,s2)
 E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
     
 psi=real_net.complex_out(torch.tensor(s2,dtype=torch.float))
@@ -353,7 +353,7 @@ s=torch.tensor(ppsi_vec.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=torch.flo
 
 psi0=ppsi_vec.complex_out(s).squeeze() # the original psi
 
-[H_nn, H_b]=O_local(nn_interaction,s.numpy(),ppsi_vec),O_local(b_field,s.numpy(),ppsi_vec)
+[H_nn, H_b]=ppsi_vec.O_local(nn_interaction,s.numpy()),ppsi_vec.O_local(b_field,s.numpy())
 E_loc=np.sum(H_nn+H_b,axis=1)
 E0=np.mean(E_loc) 
 
@@ -396,7 +396,7 @@ print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc),
       '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
 
 # Here calculate the base (unaltered) equivalent expression using O_local 
-[H_nn_ex, H_b_ex]=O_local(nn_interaction,s2,imag_net),O_local(b_field,s2,imag_net)
+[H_nn_ex, H_b_ex]=imag_net.O_local(nn_interaction,s2),imag_net.O_local(b_field,s2)
 E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
     
 psi=imag_net.complex_out(torch.tensor(s2,dtype=torch.float))

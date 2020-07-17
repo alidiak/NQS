@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_supported_layers = ['Linear', 'Conv2d']  # Supported layer class types
+_supported_layers = ['Linear', 'Conv2d','MaskedLinear']  # Supported layer class types
 _hooks_disabled: bool = False           # work-around for https://github.com/pytorch/pytorch/issues/25723
 _enforce_fresh_backprop: bool = False   # global switch to catch double backprop errors on Hessian computation
 
@@ -161,6 +161,13 @@ def compute_grad1(model: nn.Module, loss_type: str = 'mean') -> None:
             if layer.bias is not None:
                 setattr(layer.bias, 'grad1', B)
 
+        # Added by Alex Lidiak 07/7/2020 to work with Masked Auto-encoder for Density Estimation (MADE)
+        elif layer_type=='MaskedLinear': # to modify the grad for masked linear (MADE)
+            setattr(layer.weight, 'grad1', \
+        torch.einsum('nij,ij->nij',torch.einsum('ni,nj->nij', B, A),layer.mask))
+            if layer.bias is not None:
+                setattr(layer.bias, 'grad1', B)
+                
         elif layer_type == 'Conv2d':
             A = torch.nn.functional.unfold(A, layer.kernel_size)
             B = B.reshape(n, -1, A.shape[-1])
