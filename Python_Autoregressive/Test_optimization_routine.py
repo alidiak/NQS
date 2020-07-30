@@ -15,8 +15,8 @@ from NQS_pytorch import Psi, Op, kron_matrix_gen
 
 # system parameters
 b=0.0   # b-field strength
-J=1     # nearest neighbor interaction strength
-L = 3   # system size
+J= -1     # nearest neighbor interaction strength
+L = 6   # system size
 
 # Define operators to use in the Hamiltonian
 sigmax = np.array([[0, 1], [1, 0]])
@@ -57,11 +57,11 @@ H=2*L # hidden layer size
 datatype=torch.double
 
 # creates an instance of the Sequential class nn.Sigmoid etc usually in forward section
-real_net=nn.Sequential(nn.Linear(L,H), nn.Sigmoid(), nn.Linear(H,1))#,nn.Softplus())#,nn.Sigmoid()) 
+real_net=nn.Sequential(nn.Linear(L,1))#, nn.Sigmoid(), nn.Linear(H,1))#,nn.Softplus())#,nn.Sigmoid()) 
 # Always be careful of activation layers that result in exactly 0. (1/Psi->nan) in O_loc 
 
 H2=2*L
-imag_net=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),nn.Linear(H2,1))#,nn.Softplus())#,nn.Sigmoid()) 
+imag_net=nn.Sequential(nn.Linear(L,1))#,nn.Sigmoid(),nn.Linear(H2,1))#,nn.Softplus())#,nn.Sigmoid()) 
 
 # Test complex wavefunction object construction with modulus and angle
 ppsi=Psi(real_net,imag_net, L, form='euler',dtype=datatype)
@@ -72,10 +72,11 @@ ppsi=Psi(real_net,imag_net, L, form='euler',dtype=datatype)
 
 '''################## Optimization/Simulation Routine ######################'''
 # Enter simulation hyper parameters
-N_iter=300
+N_iter=100
 N_samples=10000
 burn_in=1000
-lr=0.03
+lr=0.1
+real_time_plot=True
 
 # S regularization parameters if using SR
 lambduh0, b, lambduh_min = 100, 0.95, 1e-4
@@ -84,11 +85,14 @@ lambduh0, b, lambduh_min = 100, 0.95, 1e-4
 s=np.random.randint(-1,high=1,size=[N_samples,L]); s[s==0]=1; 
 s=torch.tensor(s,dtype=datatype)
 
+if real_time_plot:
+    plt.figure
+    plt.axis([0, N_iter, min_E-0.5, round(L/2)])
+    plt.axhline(y=min_E,color='r',linestyle='-')
+
 energy_n=np.zeros([N_iter,1])
 for n in range(N_iter):
     
-    
-
     # Get the energy at each iteration
     H_nn=ppsi.O_local(nn_interaction,s.numpy())
     H_b=ppsi.O_local(b_field,s.numpy())
@@ -98,9 +102,9 @@ for n in range(N_iter):
     energy_n[n]=np.real(energy)
 
     # apply the energy gradient, updates pars in Psi object
-#    ppsi.energy_gradient(s,energy_per_sample,energy) # simple gradient descent
-    l_iter=max(lambduh0*b**(n),lambduh_min)
-    ppsi.SR(s,energy_per_sample, lambduh=l_iter)#, cutoff=1e-8)
+    ppsi.energy_gradient(s,energy_per_sample,energy) # simple gradient descent
+#    l_iter=max(lambduh0*b**(n),lambduh_min)
+#    ppsi.SR(s,energy_per_sample, lambduh=l_iter)#, cutoff=1e-8)
     
     # Euler SGD is many orders of magnitude faster! Not iterative like vector or SR.
     
@@ -116,10 +120,17 @@ for n in range(N_iter):
 
     if n%10==0:
         print('percentage of iterations complete: ', (n/N_iter)*100)
+    
+    if real_time_plot:
+        if n>=1:
+            plt.plot([n-1,n],[energy_n[n-1],energy_n[n]],'b-')
+            plt.pause(0.05)
+            plt.draw()
 
-plt.figure
-if L<=14:
-    plt.axhline(y=min_E,color='r',linestyle='-')
-plt.plot(range(N_iter),energy_n)
-plt.xlabel('Iteration number')
-plt.ylabel('Energy')
+if not real_time_plot:
+    plt.figure
+    if L<=14:
+        plt.axhline(y=min_E,color='r',linestyle='-')
+    plt.plot(range(N_iter),energy_n)
+    plt.xlabel('Iteration number')
+    plt.ylabel('Energy')

@@ -18,7 +18,7 @@ import copy
 # system parameters
 b=0.5   # b-field strength
 J=1     # nearest neighbor interaction strength
-L = 6   # system size
+L = 3   # system size
 N_samples=100 # number of samples for the Monte Carlo chains
 
 spin=0.5    # routine may not be optimized yet for spin!=0.5
@@ -58,21 +58,22 @@ H_tot=H_szsz+H_sx
 # but with increasing number of eigenvalues, the probability and output becomes
 # more complex. 
 
-hidden_layer_sizes=[10,14]
+hidden_layer_sizes=[2*L]
 nout=len(evals)*L
-model_r=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
+#model_r=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
 #The MADE coded by Andrej Karpath uses Masks to ensure that the
 # autoregressive property is upheld. natural_ordering=False 
 # randomizes autoregressive ordering, while =True makes the autoregressive 
 # order p1=f(s_1),p2=f(s_2,s_1)
 
-model_i=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
+#model_i=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
 
 def psi_init(L, hidden_layer_sizes,nout, Form='euler'):
+    nat_ording=True
     model_r=MADE(L,hidden_layer_sizes, nout, \
-                 num_masks=1, natural_ordering=True)
+                 num_masks=1, natural_ordering=nat_ording)
     model_i=MADE(L,hidden_layer_sizes, nout, \
-                 num_masks=1, natural_ordering=True)
+                 num_masks=1, natural_ordering=nat_ording)
 
     ppsi=Psi(model_r,model_i, L, form=Form,autoregressive=True)
     
@@ -248,16 +249,13 @@ def Exp_val(mat,wvf):
         /(np.matmul(np.conjugate(wvf.T),wvf))
     return O_l
 
-ppsi=psi_init(L,hidden_layer_sizes,len(evals)*L,'exponential')
-original_net=copy.deepcopy(ppsi)
-
-s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.float)
-new_s=ppsi.Autoregressive_pass(s0,evals)
-s=ppsi.Autoregressive_pass(new_s,evals)
-
-[H_nn, H_b]=ppsi.O_local(nn_interaction,s.numpy()),ppsi.O_local(b_field,s.numpy())
-E_loc=np.sum(H_nn+H_b,axis=1)
-E0=np.real(np.mean(E_loc))
+#s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.float)
+#new_s=ppsi.Autoregressive_pass(s0,evals)
+#s=ppsi.Autoregressive_pass(new_s,evals)
+#
+#[H_nn, H_b]=ppsi.O_local(nn_interaction,s.numpy()),ppsi.O_local(b_field,s.numpy())
+#E_loc=np.sum(H_nn+H_b,axis=1)
+#E0=np.real(np.mean(E_loc))
 
 #autograd_hacks.add_hooks(ppsi.real_comp)
 #outr=ppsi.real_comp(s)
@@ -265,14 +263,21 @@ E0=np.real(np.mean(E_loc))
 #autograd_hacks.compute_grad1(ppsi.real_comp)
 #
 #mult=torch.tensor(np.real(2*(np.conj(E_loc)-np.conj(E0))/psi0),dtype=torch.float)
+#def run(par_ind2,par_ind3):
+
+par_ind2 = 0
+par_ind3 = 0    
+
+ppsi=psi_init(L,hidden_layer_sizes,len(evals)*L,'exponential')
+original_net=copy.deepcopy(ppsi)
 
 ppsi.real_comp.zero_grad()
 
 pars1=list(ppsi.real_comp.parameters())
 
-dw=0.0001 # sometimes less accurate when smaller than 1e-3
+dw=0.01 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
-    pars1[0][0][0]=pars1[0][0][0]+dw
+    pars1[0][par_ind2][par_ind3]=pars1[0][par_ind2][par_ind3]+dw
 
 original_net.Autoregressive_pass(torch.tensor(s2,dtype=torch.float),evals)
 wvf0=original_net.wvf
@@ -282,9 +287,35 @@ E_tot0=np.matmul(np.matmul(np.conjugate(wvf0.T),H_tot),wvf0)/(np.matmul(np.conju
 E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conjugate(wvf1.T),wvf1))
 dif=(E_tot1-E_tot0)/dw
 
+print(wvf1-wvf0)
+
 # Here calculate the base (unaltered) equivalent expression using O_local 
-[H_nn_ex, H_b_ex]=original_net.O_local(nn_interaction,s2),original_net.O_local(b_field,s2)
+#new_s=original_net.Autoregressive_pass(torch.tensor(s2,dtype=torch.float),evals)
+#s=original_net.Autoregressive_pass(new_s,evals)
+#[H_nn_ex, H_b_ex]=original_net.O_local(nn_interaction,s.numpy()),original_net.O_local(b_field,s.numpy())
+
+N_samples=10000
+s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.float)
+_,new_s=Autoregressive_pass(original_net,s0,evals)
+_,s = Autoregressive_pass(original_net,new_s,evals)
+H_nn=original_net.O_local(nn_interaction,s.numpy())
+
+[H_nn_ex, H_b_ex]=original_net.O_local(nn_interaction,s.numpy()),original_net.O_local(b_field,s.numpy())
 E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
+
+# check energy0 estimation to exact energy difference
+print('Energy Relative Error: ', (E_tot0-np.mean(E_loc))/E_tot0)
+
+_,new_s=Autoregressive_pass(ppsi,s0,evals)
+_,s = Autoregressive_pass(ppsi,new_s,evals)
+H_nn=ppsi.O_local(nn_interaction,s.numpy())
+
+[H_nn_ex, H_b_ex]=ppsi.O_local(nn_interaction,s.numpy()),ppsi.O_local(b_field,s.numpy())
+E_loc1=np.sum(H_nn_ex+H_b_ex,axis=1)
+print('Energy Relative Error: ', (E_tot1-np.mean(E_loc1))/E_tot1)
+
+print('O_loc energy difference: ', (np.mean(E_loc1)-np.mean(E_loc))/dw,\
+      '\n compared to wvf diff: ', dif)
 
 # Get my list of vis
 outc=original_net.complex_out(torch.tensor(s2,dtype=torch.float))
@@ -304,15 +335,21 @@ for ii in range(0, L): # loop over lattice sites
     if ii==L: nlim=nout+1 # conditions for slicing. Python doesn't take slice
     else: nlim=nout       # if nout/L=int, so for ii=L, we need (nout+1)/L for 
     vi=outc[:,ii:nlim:L]   
-    si=s2[:,ii] # the input/chosen si (maybe what I'm missing from prev code/E calc)
+    si=s2[:,ii] # the input/chosen si (what I was missing from prev code/E calc)
     exp_vi=np.exp(vi) # unnorm prob of evals 
     
     # pars[0] as we're just looking at a change in 0
-    grad0=pars[0].grad1[:,:,0].numpy() # or grad1[:,:,ii]?
-    grad0=grad0[:,0] # only comparing to the 0th derivative
+    grad0=pars[0].grad1[:,par_ind2,:].numpy() # or grad1[:,:,ii]?
+    grad0=grad0[:,par_ind3] # only comparing to the 0th derivative
     
-    # calculating the normalization term
-    norm_term=np.sum((vi*np.power(exp_vi,2)/np.power(np.abs(exp_vi),3)),1)*grad0
+    # The d_w v_i term (just using exponential form for now)
+    dvi=np.einsum('i,ij->ij',grad0,vi) # for a single param should be of size=#evals
+    
+    # calculating the normalization term in the second part of the deriv
+    norm_term=1/np.sum(np.power(np.abs(exp_vi),2),1)
+    
+    # now for the rest of the second deriv part (depends on dvi)
+    sec_term=np.sum((np.power(exp_vi,2)*dvi)/np.abs(exp_vi),1)*norm_term
    
     temp_Ok=np.zeros([np.shape(s2)[0]],dtype=complex)
     for jj in range(len(evals)): 
@@ -322,13 +359,17 @@ for ii in range(0, L): # loop over lattice sites
         sel1=selection*1
         
         # For each eval/si, we must select only the subset vi(si) 
-        temp_Ok[:]+=(sel1*vi[:,jj]*grad0-norm_term)
-    Ok+=temp_Ok # manual sum over lattice sites ii=0->N
+        temp_Ok[:]+=(sel1*dvi[:,jj])#-sel1*sec_term)
+    Ok+=temp_Ok-sec_term # manual sum over lattice sites ii=0->N
+    
 
 deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
 Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))
 
 print('\n Expecation val deriv: ', deriv_E0, '\n vs numerical wvf energy diff: ', dif)
+print(dif/deriv_E0)
+
+#    return
 
 '''#### Test model in Ppsi Object Construction & with Methods  ####'''
 

@@ -156,7 +156,7 @@ def compute_grad1(model: nn.Module, loss_type: str = 'mean') -> None:
         else:  # loss_type == 'sum':
             B = layer.backprops_list[0]
 
-        if layer_type == 'Linear':
+        if layer_type == 'Linear': # or layer_type=='MaskedLinear':
             setattr(layer.weight, 'grad1', torch.einsum('ni,nj->nij', B, A))
             if layer.bias is not None:
                 setattr(layer.bias, 'grad1', B)
