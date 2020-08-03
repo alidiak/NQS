@@ -347,12 +347,18 @@ class Psi:
             #        T1=np.tensordot(np.conj(Ok_list[kk]),Ok_list[kk].T, axes=((0,2),(2,0)))/N_samples
                     T1=np.einsum("kn,mk->nm",np.conj(Ok),Ok.T)/N_samples
                     # These are methods are equivalent! Good sanity check (einsum more versitile)
-                    S=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T))+1e-5*np.eye(T1.shape[0],T1.shape[1]) # the S+c.c. term
+                    S=2*np.real(T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T))# the S+c.c. term
                     # folowing same reg/style as senior design matlab code
+#                    l_reg=1e-5*np.eye(T1.shape[0],T1.shape[1]) 
+                    l_reg=lambduh*np.eye(S.shape[0],S.shape[1])*np.diag(S) # regulation term
+#                    l_reg=1e-5*np.diag(np.diag(S)) # regulation term
 #                    S=T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)+1e-5*np.eye(T1.shape[0],T1.shape[1]) 
-                    S_inv=np.linalg.inv(S)
+                    try:
+                        S_inv=np.linalg.inv(S+l_reg+1e-5*np.eye(T1.shape[0],T1.shape[1]))
+                    except np.linalg.LinAlgError:
+                        print('\n\n S matrix: ', S, '\n\n caused singular value error')
+                        raise SystemExit(0)
 #                    S[S<cutoff]=0
-#                    l_reg=lambduh*np.eye(S.shape[0],S.shape[1])*np.diag(S) # regulation term
                     # SVD Inversion alg
 #                    [U,D,VT]=np.linalg.svd(S+l_reg)
 #                    D=np.diag(1/D) # inverting the D matrix, for SVD, M'=V (D^-1) U.T = (U(D^-1)V.T).T

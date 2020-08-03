@@ -17,8 +17,8 @@ from NQS_pytorch import Op, Psi, kron_matrix_gen
 import autograd_hacks
 
 # system parameters
-b=0.0   # b-field strength
-J= -1   # nearest neighbor interaction strength
+b=0.5   # b-field strength
+J= 1   # nearest neighbor interaction strength
 L = 2   # system size
 burn_in=1000
 N_samples=10000 # number of samples for the Monte Carlo chains
@@ -143,8 +143,8 @@ def SR(ppsi,s,E_loc, E0=None, lambduh=1):#, cutoff=1e-8):
 #                print(np.matmul(np.conj(Exp_Ok),Exp_Ok.T))
                 S=T1-np.matmul(np.conj(Exp_Ok),Exp_Ok.T)
                 S=S+1e-5*np.diag(np.diag(S))#+1e-5*np.eye(S.shape[0],S.shape[1])
-                S_inv=np.linalg.inv(S)
                 print('\n\n S: ', S)
+                S_inv=np.linalg.inv(S)
 #                S[S<cutoff]=0
 #                l_reg=lambduh*np.eye(S.shape[0],S.shape[1])*np.diag(S) # regulation term
                 # SVD Inversion alg

@@ -237,6 +237,128 @@ E_exact=np.matmul(np.matmul(np.conjugate(wvf.T),H_tot),wvf)/(np.matmul(np.conjug
 print('\n\n Energy using O_local in the analytical expression: ',O_loc_analytic, \
       '\n vs. that calculated with matrices: ', E_exact )
 
+'''################## Test DPsi/DW Calculation #########################'''
+
+ppsi=psi_init(L,hidden_layer_sizes,len(evals)*L,'exponential')
+original_net=copy.deepcopy(ppsi)
+
+ppsi.real_comp.zero_grad()
+
+pars1=list(ppsi.real_comp.parameters())
+
+dw=0.001 # sometimes less accurate when smaller than 1e-3
+with torch.no_grad():
+    pars1[0][0][0]=pars1[0][0][0]+dw
+
+# Choose a specific s
+s=torch.tensor(np.random.choice(evals,[1,L]),dtype=torch.float)
+#s=torch.ones([1,L])
+
+# First let's test the autodifferentiation:
+if not hasattr(original_net.real_comp,'autograd_hacks_hooks'):             
+    autograd_hacks.add_hooks(original_net.real_comp)
+out_0=original_net.real_comp(s)
+out_0.mean().backward()
+autograd_hacks.compute_grad1(original_net.real_comp)
+autograd_hacks.clear_backprops(original_net.real_comp)
+pars=list(original_net.real_comp.parameters())
+grad0=pars[0].grad1[0,:,:]
+
+#out_0=original_net.real_comp(s)
+#out_0.mean().backward()
+#pars=list(original_net.real_comp.parameters())
+#grad0=pars[0].grad #* (1/N_samples)
+      
+# Calculate the new and old wavefunctions for this s, numerical dln(Psi)
+original_net.Autoregressive_pass(s,evals)
+wvf0=original_net.wvf
+ppsi.Autoregressive_pass(s,evals)
+wvf1=ppsi.wvf
+wvf_dif=(np.log(wvf1)-np.log(wvf0))/dw; print('\n Numerical dPsi/dw: ', wvf_dif)
+  
+out_1=ppsi.real_comp(s)
+deriv=(torch.mean(out_1)-torch.mean(out_0))/dw
+
+print('numberical deriv: ', deriv.item(), '\n pytorch deriv: ', grad0[0][0].item(), \
+        '\n ratio: ', deriv.item()/grad0[0][0].item() )
+
+# Now calculate the analytically derived derivative of ln(Psi)
+
+# Get my list of vis
+outc=original_net.complex_out(s)
+
+Ok=np.zeros([np.shape(s)[0]],dtype=complex)
+# Accumulate O_omega1 over lattice sites (also have to see which s where used)
+for ii in range(0, L): # loop over lattice sites
+#    if ii==L: nlim=nout+1 # conditions for slicing. Python doesn't take slice
+#    else: nlim=nout       # if nout/L=int, so for ii=L, we need (nout+1)/L for 
+    vi=outc[:,ii::L] 
+#    vi=outc[:,2*ii:(2*ii+2)]
+#    vi=outc[:,0:2]
+    si=s[:,ii].numpy() # the input/chosen si (what I was missing from prev code/E calc)
+    exp_vi=np.exp(vi) # unnorm prob of evals 
+    
+    # pars[0] as we're just looking at a change in 0
+    grad0=pars[0].grad1[:,0,:].numpy() # or grad1[:,:,ii]?
+    grad0=grad0[:,0] # only comparing to the 0th derivative
+    
+    # The d_w v_i term (just using exponential form for now)
+    dvi=np.einsum('i,ij->ij',grad0,vi) # for a single param should be of size=#evals
+    
+    # calculating the normalization term in the second part of the deriv
+    norm_term=1/np.sum(np.power(np.abs(exp_vi),2),1)
+    
+    # now for the rest of the second deriv part (depends on dvi)
+#    sec_term=np.sum((np.power(exp_vi,2)*dvi)/np.abs(exp_vi),1)*norm_term
+    sec_term=0
+   
+    temp_Ok=np.zeros([np.shape(s)[0]],dtype=complex)
+    for jj in range(len(evals)): 
+        
+        selection=(si==evals[jj]) # which s were sampled 
+                                #(which indices correspond to the si)
+        sel1=selection*1
+        
+        # For each eval/si, we must select only the subset vi(si) 
+        temp_Ok[:]+=(sel1*dvi[:,jj])#-sel1*sec_term)
+    Ok+=temp_Ok-sec_term # manual sum over lattice sites ii=0->N
+
+print('\n\n Ratio numerical/analytic: ', wvf_dif/Ok)
+
+# Peice of Ln(Psi)
+out0=original_net.complex_out(s).squeeze()
+out1=ppsi.complex_out(s).squeeze()
+
+grads=pars[0].grad1.detach().numpy()
+dvi0=0; vi0_l=np.zeros([L,1],dtype=complex)
+vs0=0; vs1=0;
+sec0=0; sec1=0;
+for ii in range(L):
+    vi0=out0[ii::L]
+    vi1=out1[ii::L]
+    
+    selection=(s[:,ii]==evals[jj])
+    
+    vs0+=vi0[selection]
+    vs1+=vi1[selection]
+    
+    dvi0+=vi0[selection]*pars[0].grad1[0][0][0].numpy()
+    vi0_l[ii]=vi0[selection]
+    
+    sec0+=0.5*np.log(np.sum(np.power(np.abs(np.exp(vi0)),2)))
+    sec1+=0.5*np.log(np.sum(np.power(np.abs(np.exp(vi1)),2)))
+    
+ft_diff=(vs1-vs0)/dw; st_diff=(sec1-sec0)/dw
+# Making sure things all add up correctly:
+assert abs(np.log(wvf1)-(vs1-sec1))<1e-6 and abs(np.log(wvf0)-(vs0-sec0))<1e-6
+print('\n\n Numerical dPsi/dw minus first-second term diff', wvf_dif-(ft_diff-st_diff))
+
+print('\n Analytic dPsi/dw: ', Ok)
+print('\n First term deriv/difference: ', ft_diff)
+print('\n compared to sum(vs0*grad1): ', pars[0].grad1[0][0][0].numpy()*vs0)
+print('\n Second term deriv/difference: ', st_diff)
+
+
 '''################## Test Energy Gradient #########################'''
 
 # function to apply multipliers to the expectation value O_local expression 
@@ -362,6 +484,9 @@ for ii in range(0, L): # loop over lattice sites
         temp_Ok[:]+=(sel1*dvi[:,jj])#-sel1*sec_term)
     Ok+=temp_Ok-sec_term # manual sum over lattice sites ii=0->N
     
+
+[H_nn_ex, H_b_ex]=original_net.O_local(nn_interaction,s2),original_net.O_local(b_field,s2)
+E_loc=np.sum(H_nn_ex+H_b_ex,axis=1)
 
 deriv_E0=Exp_val(np.conj(Ok)*E_loc,wvf0)+Exp_val(Ok*np.conj(E_loc),wvf0)-\
 Exp_val(E_loc,wvf0)*(Exp_val(np.conj(Ok),wvf0)+Exp_val(Ok,wvf0))

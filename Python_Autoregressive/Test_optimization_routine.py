@@ -6,6 +6,7 @@ Created on Tue May 12 16:26:40 2020
 @author: alex
 """
 
+import itertools
 import time
 import numpy as np
 import torch
@@ -14,9 +15,11 @@ import matplotlib.pyplot as plt
 from NQS_pytorch import Psi, Op, kron_matrix_gen
 
 # system parameters
-b=0.0   # b-field strength
+b=0.5   # b-field strength
 J= -1     # nearest neighbor interaction strength
-L = 6   # system size
+L = 10   # system size
+
+datatype=torch.double
 
 # Define operators to use in the Hamiltonian
 sigmax = np.array([[0, 1], [1, 0]])
@@ -51,17 +54,22 @@ if L<=14:
     H_tot=H_szsz+H_sx
 
     min_E=np.min(np.linalg.eigvals(H_tot))
+    
+    s2=torch.tensor(list(itertools.product(evals,repeat=L)),dtype=datatype)
 
 '''##### Define Neural Networks and the form for Psi (euler or vector) #####'''
 H=2*L # hidden layer size
-datatype=torch.double
 
 # creates an instance of the Sequential class nn.Sigmoid etc usually in forward section
-real_net=nn.Sequential(nn.Linear(L,1))#, nn.Sigmoid(), nn.Linear(H,1))#,nn.Softplus())#,nn.Sigmoid()) 
+real_net=nn.Sequential(nn.Linear(L,H), nn.Sigmoid(), nn.Linear(H,1))#,nn.Softplus())#,nn.Sigmoid()) 
+#real_net=nn.Sequential(nn.Linear(L,1))#,nn.Softplus())#,nn.Sigmoid()) 
 # Always be careful of activation layers that result in exactly 0. (1/Psi->nan) in O_loc 
 
 H2=2*L
-imag_net=nn.Sequential(nn.Linear(L,1))#,nn.Sigmoid(),nn.Linear(H2,1))#,nn.Softplus())#,nn.Sigmoid()) 
+imag_net=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),nn.Linear(H2,1,bias=False))#,nn.Softplus())#,nn.Sigmoid()) 
+#imag_net=nn.Sequential(nn.Linear(L,1,bias=False))#,nn.Sigmoid(),nn.Linear(H2,1,bias=False),nn.Softplus())#,nn.Sigmoid()) 
+# always set bias=False for imaginary comp if using exponential or euler forms 
+# otherwise there is a strong bias term that is an artifact (& leads to singular values)
 
 # Test complex wavefunction object construction with modulus and angle
 ppsi=Psi(real_net,imag_net, L, form='euler',dtype=datatype)
@@ -72,11 +80,12 @@ ppsi=Psi(real_net,imag_net, L, form='euler',dtype=datatype)
 
 '''################## Optimization/Simulation Routine ######################'''
 # Enter simulation hyper parameters
-N_iter=100
+N_iter=300
 N_samples=10000
 burn_in=1000
 lr=0.1
 real_time_plot=True
+exact_energy=True
 
 # S regularization parameters if using SR
 lambduh0, b, lambduh_min = 100, 0.95, 1e-4
@@ -86,37 +95,46 @@ s=np.random.randint(-1,high=1,size=[N_samples,L]); s[s==0]=1;
 s=torch.tensor(s,dtype=datatype)
 
 if real_time_plot:
-    plt.figure
+    plt.figure()
     plt.axis([0, N_iter, min_E-0.5, round(L/2)])
     plt.axhline(y=min_E,color='r',linestyle='-')
 
 energy_n=np.zeros([N_iter,1])
 for n in range(N_iter):
     
-    # Get the energy at each iteration
-    H_nn=ppsi.O_local(nn_interaction,s.numpy())
-    H_b=ppsi.O_local(b_field,s.numpy())
-    energy_per_sample = np.sum(H_nn+H_b,axis=1)
-#    energy_per_sample = np.sum(H_nn,axis=1)
-    energy=np.mean(energy_per_sample)
-    energy_n[n]=np.real(energy)
-
-    # apply the energy gradient, updates pars in Psi object
-    ppsi.energy_gradient(s,energy_per_sample,energy) # simple gradient descent
-#    l_iter=max(lambduh0*b**(n),lambduh_min)
-#    ppsi.SR(s,energy_per_sample, lambduh=l_iter)#, cutoff=1e-8)
-    
-    # Euler SGD is many orders of magnitude faster! Not iterative like vector or SR.
-    
-    ppsi.apply_grad(lr) # releases/updates parameters based on grad method (stored in pars.grad)
-
     # before doing the actual sampling, we should do a burn in
-    sburn=ppsi.sample_MH(burn_in,spin=0.5)
-
+    sb=ppsi.sample_MH(burn_in,spin=0.5)
+    
     start = time.time()
     # Now we sample from the state and recast this as the new s, s0 so burn in is used
-    s=torch.tensor(ppsi.sample_MH(N_samples,spin=0.5,s0=sburn[-1,:]),dtype=datatype)
+    s=torch.tensor(ppsi.sample_MH(N_samples,spin=0.5, s0=sb[-1]),dtype=datatype)
     end = time.time(); print(end - start) # MC Sampling is the real bottleneck
+    
+    if exact_energy and L<=14: # if want to test the energy without sampling
+        wvf=ppsi.complex_out(s2)
+        E_tot=np.matmul(np.matmul(np.conjugate(wvf.T),H_tot),wvf)\
+        /(np.matmul(np.conjugate(wvf.T),wvf))
+        
+#        s=s2
+        # Need sampling, as s2 will have low prob states of Psi disproportionately represented
+        # Get the energy at each iteration
+        [H_nn, H_b]=ppsi.O_local(nn_interaction,s.numpy()),ppsi.O_local(b_field,s.numpy())
+        energy_per_sample = np.sum(H_nn+H_b,axis=1)
+        energy_n[n]=E_tot
+    else:
+        # Get the energy at each iteration
+        [H_nn, H_b]=ppsi.O_local(nn_interaction,s.numpy()),ppsi.O_local(b_field,s.numpy())
+        energy_per_sample=np.sum(H_nn+H_b,axis=1)
+        energy_n[n] = np.real(np.mean(energy_per_sample))
+    
+    # apply the energy gradient, updates pars in Psi object
+#    ppsi.energy_gradient(s,energy_per_sample,energy_n[n]) # simple gradient descent
+    l_iter=max(lambduh0*b**(n),lambduh_min)
+    ppsi.SR(s,energy_per_sample, lambduh=l_iter)#, cutoff=1e-8)
+    
+    # Euler SGD is many orders of magnitude faster! Not iterative like vector or SR.
+    lr=lr*0.99
+    ppsi.apply_grad(lr) # releases/updates parameters based on grad method (stored in pars.grad)
 
     if n%10==0:
         print('percentage of iterations complete: ', (n/N_iter)*100)
@@ -128,7 +146,7 @@ for n in range(N_iter):
             plt.draw()
 
 if not real_time_plot:
-    plt.figure
+    plt.figure()
     if L<=14:
         plt.axhline(y=min_E,color='r',linestyle='-')
     plt.plot(range(N_iter),energy_n)
