@@ -212,7 +212,65 @@ class Psi:
     a given form of Psi. It does simple gradient descent (no SR or anything).
     It does so given an E_local, Energy E, and wavefunc Psi over sample set s.'''
 
-    def energy_gradient(self, s, E_loc, E=None): # add Pytorch optimizer) (fixed lr for now)
+    def energy_gradient(self, s, E_loc, E0=None):#, cutoff=1e-8): 
+        
+        if E0 is None:
+            E0=np.real(np.mean(E_loc))
+            
+        N_samples=s.shape[0]
+        
+#        if self.autoregressive:
+            
+        # Calculate all of the different multipliers for each form
+        if self.form.lower()=='vector':               
+            m_r=(1/self.complex_out(s)).squeeze()
+            m_i=1j*m_r
+            
+        elif self.form.lower()=='euler' or self.form.lower()=='exponential'\
+             or self.form.lower()=='real':
+                 
+            if self.form.lower()=='euler' or self.form.lower()=='real':
+                m_r=1/self.real_comp(s).detach().numpy().squeeze()
+                
+            else:
+                m_r=(np.ones([N_samples,1])).squeeze()
+            m_i=(np.ones([N_samples,1])*1j).squeeze()            
+            
+        E_arg=(np.conj(E_loc)-np.conj(E0))
+        
+        for ii in range(2):
+            if ii==0: # Compute GD for real component
+                model=self.real_comp; m=m_r
+            else: # Compute GD for imag component
+                model=self.imag_comp; m=m_i
+                
+            model.zero_grad()
+            
+            if not hasattr(model,'autograd_hacks_hooks'):             
+                autograd_hacks.add_hooks(model)
+            outr=model(s)
+            outr.mean().backward()
+            autograd_hacks.compute_grad1(model) #computes grad per sample for all samples
+            
+            pars=list(model.parameters())
+                
+            for param in pars:
+                if len(param.size())==2:#different mat mul rules depending on mat shape
+                    ein_str="i,ijk->ijk"
+                elif len(param.size())==1:
+                    ein_str="i,ik->ik"
+                with torch.no_grad():      
+                    param.grad=torch.einsum(ein_str,torch.tensor(np.real(2*E_arg*m)\
+                    ,dtype=self.dtype),param.grad1).mean(0) # force/DE term
+            
+            autograd_hacks.clear_backprops(model)
+            # exits for loop so it is only applied to real comp
+            if self.form.lower()=='real':
+                break 
+            
+        return
+
+    def energy_gradient1(self, s, E_loc, E=None): # add Pytorch optimizer) (fixed lr for now)
         
         if E is None:
             E=np.mean(E_loc)
@@ -228,6 +286,7 @@ class Psi:
             outr = self.real_comp(s).flatten()
             mult=torch.tensor(np.real(2*diff),dtype=self.dtype)
             (outr.log()*mult).mean().backward()
+            
         elif self.form.lower()=='euler' or self.form.lower()=='exponential':
             
             outr = self.real_comp(s).flatten()
@@ -237,7 +296,9 @@ class Psi:
             # MODULUS
             mult=torch.tensor(np.real(2*diff),dtype=self.dtype)
             if self.form.lower()=='euler':
+#                assert torch.all(outr>0), "log of 0 or negative number"
                 (outr.log()*mult).mean().backward()
+                
             elif self.form.lower()=='exponential':
                 (mult*outr).mean().backward() 
             # calling this applies autograd to tensor .grad object i.e. out*mult
@@ -298,6 +359,88 @@ class Psi:
             autograd_hacks.clear_backprops(self.imag_comp)
             
         return 
+
+    '''################# Autoregressive Gradient Descent ###################'''
+
+    def autoregressive_grad(self, E_loc, s, evals, comp):
+        N_samples=s.shape[0]
+        if comp.lower()=='real':
+            model=self.real_comp
+        else: model=self.imag_comp
+        
+#        E0=np.real(np.mean(E_loc))
+        E_arg=(np.conj(E_loc)-np.conj(np.mean(E_loc)))
+        
+        # Get my list of vis
+        outc=self.complex_out(s)
+        if not hasattr(model,'autograd_hacks_hooks'):             
+            autograd_hacks.add_hooks(model)
+        out=model(s)
+        pars=list(model.parameters())
+        
+        # initializing some numpy lists to record both the Ok and be a temporary holder
+        # for the grad of each eval (which changes each ii, kk loop, but most efficient to initalize once)
+        E_grad= [[] for i in range(len(pars))]
+        gradii= [[] for i in range(len(pars))]
+#        model.zero_grad()
+        for rr in range(len(pars)):
+            if len(pars[rr].size())==2:
+                [sz1,sz2]=[pars[rr].size(0),pars[rr].size(1)]
+            else:
+                [sz1,sz2]=[pars[rr].size(0),1]
+            E_grad[rr]=np.zeros([sz1,sz2],dtype=complex)
+            gradii[rr]=np.zeros([N_samples,sz1,sz2,len(evals)])
+            
+        ## Accumulate O_omega1 over lattice sites (also have to see which s where used)
+        for ii in range(0, self.L): # loop over lattice sites
+            N_samples=s.shape[0]
+            vi=outc[:,ii::self.L] 
+            psi_i=out[:,ii::self.L]
+            si=s[:,ii] # the input/chosen si (what I was missing from prev code/E calc)
+            exp_t=np.exp(2*np.real(vi))
+            norm_term=np.sum(exp_t,1)
+                    
+            for kk in range(len(evals)): # have to get the dpsi separately FROM EACH OUTPUT vi
+        #        original_net.real_comp.zero_grad()
+                psi_i[:,kk].mean().backward(retain_graph=True) # mean necessary over samples
+                                                    # grad1 will save the per sample grad
+                autograd_hacks.compute_grad1(model)
+                autograd_hacks.clear_backprops(model) 
+                for rr in range(len(pars)):
+                    if len(pars[rr].size())==1:
+                        gradii[rr][...,kk]=pars[rr].grad1.numpy()[...,None]
+                    else:
+                        gradii[rr][...,kk]=pars[rr].grad1.numpy()
+#                        
+            for rr in range(len(pars)): # have to include all pars 
+                grad=gradii[rr]
+            
+                # derivative term (will differ depending on ansatz 'form')
+                if self.form.lower()=='exponential':
+                    if comp.lower()=='real': dvi = np.einsum('il,ijkl->ijkl', vi, grad)
+                    else: dvi = np.einsum('il,ijkl->ijkl', 1j*vi, grad)
+                else: raise ValueError('grad for specified form not defined')
+        
+                st_mult =  np.sum(np.einsum('il,ijkl->ijkl', exp_t, np.real(dvi)),-1)
+                sec_term=np.einsum('i,ijk->ijk', 1/norm_term, st_mult)
+               
+                temp_Ok=np.zeros_like(sec_term,dtype=complex)
+                for kk in range(len(evals)): 
+                    
+                    selection=(si==evals[kk]) # which s were sampled 
+                                                #(which indices correspond to the si)
+                    sel1=selection*1
+                        
+                        # For each eval/si, we must select only the subset vi(si) 
+                    temp_Ok[:]+=np.einsum('i,ijk->ijk',sel1,dvi[...,kk])
+                    
+                E_grad[rr] += np.mean(np.einsum('i,ijk->ijk', 2*np.real(E_arg), \
+                  np.real(temp_Ok-sec_term)),0)
+            
+            for rr in range(len(pars)):
+                pars[rr].grad=torch.tensor(np.real(E_grad[rr]),dtype=self.dtype).squeeze()
+            
+        return # E_grad
 
     '''################### Stochatic Reconfiguation ########################'''
 
@@ -499,7 +642,7 @@ class Psi:
             born_psi=np.power(np.abs(psi),2)
             
             # satisfy the normalization condition?
-            assert np.all(np.sum(born_psi,1)-1<1e-6), "Psi not normalized correctly"
+#            assert np.all(np.sum(born_psi,1)-1<1e-6), "Psi not normalized correctly"
         
             # Now let's sample from the binary distribution
             rands=np.random.rand(N_samples)
@@ -513,7 +656,7 @@ class Psi:
                 psi_s+=prev_selection*1*psi[:,jj]
                 
                 # sampling if a<born_psi, sample
-                selection=((0<=rands)*(rands-born_psi[:,jj]<=1.5e-7)) 
+                selection=((0<=rands)*(rands-born_psi[:,jj]<=5e-7)) 
                 # Due to precision have to use <=1e-7 as errors will occur
                 # when comparing differences of order 1e-8. (see below check)
                 checker+=selection*1
@@ -524,8 +667,9 @@ class Psi:
             
             if not np.all(checker)==1: 
                 prob_ind=np.where(checker==0)
-                raise ValueError("N_samples were not sampled. error at: ", \
-                    prob_ind, 'with ', rands[prob_ind], born_psi[prob_ind,:])
+                raise ValueError("N_samples were not sampled. error at: \n", \
+                    prob_ind, '\n with random array: \n', rands[prob_ind],\
+                    '\n and probability array: \n', born_psi[prob_ind,:])
             
 #            assert np.all(checker)==1, "N_samples were not sampled"
             
@@ -795,5 +939,96 @@ def kron_matrix_gen(op_list,D,N,bc):
 #                .view(p_i[kk].size()).detach()
 #            else:
 #                p_i[kk].grad=torch.mm(S_inv,grad_list_i[kk])
+#            
+#        return 
+#
+#
+#    def energy_gradient(self, s, E_loc, E=None): # add Pytorch optimizer) (fixed lr for now)
+#        
+#        if E is None:
+#            E=np.mean(E_loc)
+#                
+#        E=np.conj(E)
+#        E_loc=np.conj(E_loc)
+#        diff=(E_loc-E)
+#        
+#        self.real_comp.zero_grad()
+#        if not self.re: self.imag_comp.zero_grad()
+#        # should be the simpler form to apply dln(Psi)/dw_i
+#        if self.form.lower()=='real':
+#            outr = self.real_comp(s).flatten()
+#            mult=torch.tensor(np.real(2*diff),dtype=self.dtype)
+#            (outr.log()*mult).mean().backward()
+#            
+#        elif self.form.lower()=='euler' or self.form.lower()=='exponential':
+#            
+#            outr = self.real_comp(s).flatten()
+#            outi = self.imag_comp(s).flatten()
+#            
+#            # each form has a slightly different multiplication form
+#            # MODULUS
+#            mult=torch.tensor(np.real(2*diff),dtype=self.dtype)
+#            if self.form.lower()=='euler':
+#                assert torch.all(outr>0), "log of 0 or negative number"
+#                (outr.log()*mult).mean().backward()
+#                
+#            elif self.form.lower()=='exponential':
+#                (mult*outr).mean().backward() 
+#            # calling this applies autograd to tensor .grad object i.e. out*mult
+#            # which corresponds to dpsi_real(s)/dpars. 
+#            
+#            # ANGLE
+#            mult = torch.tensor(2*np.imag(-E_loc),dtype=self.dtype)
+#            (mult*outi).mean().backward()
+#            
+#        # Although the speed difference is not significant, the above is still 
+#        # faster than using the autograd_hacks per sample gradient version used
+#        # for the vector gradients below
+#            
+#        elif self.form.lower()=='vector':
+#            if np.all(self.complex==0): 
+#        # could create errors if doesn't use the updated ppsi and new s
+#        # but each call of O_local redefines the .complex
+#                self.complex_out(s) # define self.complex
+#              
+#            # hooks accumulate the gradient per sample into layers.backprops_list
+#            # only called once otherwise extra grads are accumulated
+#            if not hasattr(self.real_comp,'autograd_hacks_hooks'):             
+#                autograd_hacks.add_hooks(self.real_comp)
+#            if not hasattr(self.imag_comp,'autograd_hacks_hooks'): 
+#                autograd_hacks.add_hooks(self.imag_comp)
+#            outr=self.real_comp(s)
+#            outi=self.imag_comp(s)
+#            outr.mean().backward()
+#            outi.mean().backward()
+#            autograd_hacks.compute_grad1(self.real_comp)
+#            autograd_hacks.compute_grad1(self.imag_comp)
+#            
+#            m=2*(np.conj(E_loc)-np.conj(E))/self.complex.squeeze()
+#            
+#            p_r=list(self.real_comp.parameters())
+#            p_i=list(self.imag_comp.parameters())
+#            
+#            # multiplying the base per sample grad in param.grad1 by the dPsi
+#            # derivative term and assigning to the .grad variable to be applied 
+#            # to each parameter variable with the apply_grad function. 
+#            for param in p_r:
+#                if len(param.size())==2:
+#                    ein_str="i,ijk->ijk"
+#                elif len(param.size())==1:
+#                    ein_str="i,ik->ik"
+#                param.grad=torch.einsum(ein_str,torch.tensor(np.real(m)\
+#                    ,dtype=self.dtype),param.grad1).mean(0)
+#            for param in p_i: # dPsi here is 1j*dPsi of real
+#                if len(param.size())==2:
+#                    ein_str="i,ijk->ijk"
+#                elif len(param.size())==1:
+#                    ein_str="i,ik->ik"
+#                param.grad=torch.einsum(ein_str,torch.tensor(np.real(1j*m)\
+#                    ,dtype=self.dtype),param.grad1).mean(0)
+#          
+#            # clear backprops_list for next run
+#            autograd_hacks.clear_backprops(self.real_comp)
+#            autograd_hacks.clear_backprops(self.imag_comp)
 #            
 #        return 
