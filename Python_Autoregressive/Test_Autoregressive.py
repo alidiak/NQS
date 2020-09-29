@@ -7,14 +7,21 @@ Created on Wed Jun 24 16:15:18 2020
 """
 
 import numpy as np
-from made import MADE
-import autograd_hacks
+from autograd_hacks_master import autograd_hacks
 import matplotlib.pyplot as plt
 import torch
 from NQS_pytorch import Psi, Op, kron_matrix_gen
 import time
 import itertools
 import copy
+
+# Load libraries and the models therein
+import sys
+sys.path.insert(1, '/home/alex/Documents/QML_Research/Variational_Learning_'\
+  'Implementations/Python_Autoregressive/models')
+
+# Overarching torch datatype and precision
+datatype=torch.double
 
 # system parameters
 b=0.0   # b-field strength
@@ -60,39 +67,75 @@ min_E=np.min(np.linalg.eigvals(H_tot))
 # but with increasing number of eigenvalues, the probability and output becomes
 # more complex. 
 
-hidden_layer_sizes=[2*L]
 nout=len(evals)*L
-#model_r=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
+hidden_layer_sizes=2*L
+
+# NADE model in Pytorch Generative library by Eugen Hotaj
+#import pytorch_generative as pg
+#
+#model_r=pg.models.NADE(L,hidden_layer_sizes)
+#model_i=pg.models.NADE(L,hidden_layer_sizes)
+#
+#def psi_init(L, hidden_layer_sizes, nout=L, Form='exponential', dtype=torch.float):
+#   
+#    model_r=pg.models.NADE(L,hidden_layer_sizes)
+#    model_i=pg.models.NADE(L,hidden_layer_sizes)
+#
+#    ppsi=Psi(model_r,model_i, L, form=Form,dtype=datatype, autoregressive=True)
+#    
+#    return ppsi
+
+# NADE model by simonjisu
+from NADE_pytorch_master.model import NADE
+
+model_r=NADE(L,hidden_layer_sizes)
+model_i=NADE(L,hidden_layer_sizes)
+
+def psi_init(L, hidden_layer_sizes, nout=L, Form='exponential', dtype=torch.float):
+   
+    model_r=NADE(L,hidden_layer_sizes)
+    model_i=NADE(L,hidden_layer_sizes)
+
+    ppsi=Psi(model_r,model_i, L, form=Form,dtype=datatype, autoregressive=True)
+    
+    return ppsi
+
 #The MADE coded by Andrej Karpath uses Masks to ensure that the
 # autoregressive property is upheld. natural_ordering=False 
 # randomizes autoregressive ordering, while =True makes the autoregressive 
 # order p1=f(s_1),p2=f(s_2,s_1)
 
-#model_i=MADE(L,hidden_layer_sizes, nout, num_masks=1, natural_ordering=True)
+#from models.pytorch_made_master.made import MADE
 
-def psi_init(L, hidden_layer_sizes,nout, Form='euler'):
-    nat_ording=True
-    model_r=MADE(L,hidden_layer_sizes, nout, \
-                 num_masks=1, natural_ordering=nat_ording)
-    model_i=MADE(L,hidden_layer_sizes, nout, \
-                 num_masks=1, natural_ordering=nat_ording)
-
-    ppsi=Psi(model_r,model_i, L, form=Form,autoregressive=True)
-    
-    return ppsi
+#hidden_layer_sizes=[2*L]
+#
+#def psi_init(L, hidden_layer_sizes,nout, Form='euler', dtype=torch.float):
+#    nat_ording=False
+#    model_r=MADE(L,hidden_layer_sizes, nout, \
+#                 num_masks=1, natural_ordering=nat_ording)
+#    model_i=MADE(L,hidden_layer_sizes, nout, \
+#                 num_masks=1, natural_ordering=nat_ording)
+#
+#    ppsi=Psi(model_r,model_i, L, form=Form,dtype=datatype, autoregressive=True)
+#    
+#    return ppsi
 
 '''############### Autoregressive Sampling and Psi ########################'''
 
-# initialize/start with a random vector
-s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.double)
-
-ppsi=psi_init(L,hidden_layer_sizes,nout,'exponential')
-
-start = time.time()
 # Begin the autoregressive sampling and Psi forward pass routine 
+
 def Autoregressive_pass(ppsi,s,evals):
     outc=ppsi.complex_out(s) # the complex output given an ansatz form  
+    
+    # The structure for the NADE is a bit different, assumed binary and doesn't have
+    # a variable number of outputs. (# inputs=#outputs). Combining like this 
+    # works with current code and the original staggered MADE structure.
+    real_probs = torch.cat((ppsi.real_comp(s),1-ppsi.real_comp(s)), dim=1)
+    imag_probs = torch.cat((ppsi.imag_comp(s),1-ppsi.imag_comp(s)), dim=1)
+    outc= np.exp(real_probs.detach().numpy()+1j*imag_probs.detach().numpy())
+    
     new_s=torch.zeros_like(s)
+    #   new_s=torch.zeros([N_samples,L])
     
     if len(s.shape)==2:
         [N_samples,L]=s.shape
@@ -105,27 +148,34 @@ def Autoregressive_pass(ppsi,s,evals):
     nevals=len(evals)
     
     # Making sure it is an autoregressive model
-    assert nout/L==nevals,"(Output dim)!=nevals*(Input dim), not an Autoregressive NN"
+    assert nout%L==0,"(Output dim)!=nevals*(Input dim), not an Autoregressive NN"
             
     # the full Psi is a product of the conditionals, making a running product easy
-    Ppsi=np.ones([N_samples],dtype=np.complex128) 
+    Ppsi=np.ones([N_samples],dtype=np.complex128) # if multiplying
+    #Ppsi=np.zeros([N_samples],dtype=np.complex128)  # if adding logs
     
     for ii in range(0, L): # loop over lattice sites
-        
-        if ii==L: nlim=nout+1 # conditions for slicing. Python doesn't take slice
-        else: nlim=nout       # if nout/L=int, so for ii=L, we need (nout+1)/L for 
-                            #  outc[:,nout] to be taken.
+    
         # normalized probability/wavefunction
-        vi=outc[:,ii:nlim:L] 
+        vi=outc[:,ii::L] 
         si=s[:,ii] # the input/chosen si (maybe what I'm missing from prev code/E calc)
+        if ii==0: # initially have to generate a random set
+#            si=torch.tensor(np.random.choice(evals,N_samples),dtype=datatype)
+            si=s[:,ii]
+        else: # after i=0, the following sampling depends on the previous sample (autoregressive prop)
+#            si=new_s[:,ii-1]
+            si=s[:,ii]
+    #    vi=ppsi.complex_out(si) # the forward pass requires full L inputs, this is 
+                                 # not possible, only gives partial information.
+                                 # Shouldn't be the case, is autoregressive after all...
         # The MADE is prob0 for 0-nin outputs and then prob1 for 
         # nin-2nin outputs, etc. until ((nevals-1)-nevals)*nin outputs 
-        tester=np.arange(0,nout);  # print(tester[ii:nlim:L]) # to see slices 
-        assert len(tester[ii:nlim:L])==nevals, "Network Output missing in calculation"
+    #    tester=np.arange(0,nout);  # print(tester[ii:nlim:L]) # to see slices 
+    #    assert len(tester[ii::L])==nevals, "Network Output missing in calculation"
         
         exp_vi=np.exp(vi) # unnorm prob of evals 
         norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2),1))
-        psi=np.einsum('ij,i->ij', exp_vi, 1/norm_const) # love this tool
+        psi=np.einsum('ij,i->ij', exp_vi, 1/norm_const) 
         
         born_psi=np.power(np.abs(psi),2)
         
@@ -136,70 +186,202 @@ def Autoregressive_pass(ppsi,s,evals):
         rands=np.random.rand(N_samples)
         
         psi_s=np.zeros(N_samples, complex) # needed to accumulate Ppsi
+        vi_s=np.zeros(N_samples, complex) # accumulate vi for ln(Ppsi)
         checker=np.zeros(N_samples)
-        for jj in range(nevals): 
         
+        for jj in range(nevals): 
+            
             prev_selection=(si.numpy()==evals[jj]) # which s were sampled 
             # psi(s), accumulate psi for the s that were used to gen samples
             psi_s+=prev_selection*1*psi[:,jj]
+            vi_s+=prev_selection*1*vi[:,jj]
+            
+            born_s=np.power(np.abs(prev_selection*1*psi[:,jj]),2)
+            nonzero_inds=born_s.nonzero()[0]
+        
+            rands=np.random.rand(len(nonzero_inds))
+        
+    #       positive condition for eval0
+            sel0=(rands<born_s[nonzero_inds])
+    #       positive condition for eval1
+            sel1=(rands>born_s[nonzero_inds])
+            
+            # This way of sampling may always lead to a uniform dist.
+            new_s[nonzero_inds,ii]= torch.tensor(sel0*1*evals[0]+sel1*1*evals[1],dtype=datatype)
             
             # sampling if a<born_psi, sample
-            selection=((0<=rands)*(rands-born_psi[:,jj]<=1.5e-7)) 
-            # Due to precision have to use <=1e-7 as errors will occur
-            # when comparing differences of order 1e-8. (see below check)
-            checker+=selection*1
+    #        selection=((0<=rands)*(rands-born_psi[:,jj]<1.5e-7)) 
+    #        selection=((0<=rands)*(rands-prev_selection*1*born_psi[:,jj]<1.5e-14)) 
+    #         Due to precision have to use <=1e-7 as errors will occur
+    #         when comparing differences of order 1e-8. (see below check)
             
-            new_s[selection,ii]=evals[jj]
-    
-            rands=rands-born_psi[:,jj] # shifting the rands for the next sampling
+            checker+=prev_selection*1
+            
+    #        new_s[selection,ii]=evals[jj]
+            
+    #        rands=rands-born_psi[:,jj] # shifting the rands for the next sampling
+    #        rands=rands-prev_selection*born_psi[:,jj]
+            
+    #        rands=rands-prev_selection*1*born_psi[:,jj]
+            
+        # doesn't work
+    #        selection1=(rands<np.power(np.abs(psi_s),2))
+    #        selection2=(rands>np.power(np.abs(psi_s),2))
+    #        checker=selection1*1+selection2*1
+    #        new_s[selection1,ii]=evals[1]
+    #        new_s[selection2,ii]=evals[0]
+            
+    #        rands=rands-born_psi[:,jj] # shifting the rands for the next sampling
+    #        rands=rands-born_psi[prev_selection,jj]
+    #        rands=rands-np.power(np.abs(psi_s),2)
         
-        if not np.all(checker)==1: 
-            prob_ind=np.where(checker==0)
-            raise ValueError("N_samples were not sampled. error at: ", \
-                prob_ind, 'with ', rands[prob_ind], born_psi[prob_ind,:])
-                
+    #        if not np.all(checker)==1: 
+    #            prob_ind=np.where(checker==0)
+    #            raise ValueError("N_samples were not sampled. error at: ", \
+    #                prob_ind, 'with ', rands[prob_ind], born_psi[prob_ind,:])
+        
+    #        if ii==0: prev_psi=np.ones_like(psi_s)
+    #        acc_psi=psi_s*prev_psi
+    #        prev_psi=psi_s
+            
+        # Let's just directly sample from psi_i(s) to make sure it works.
+        # Doesn't even make sense... Why would I have full state space in first psi(s)?
+    #        samplepos=np.zeros([N_samples,1]) # record the sampled states
+    #        probs=np.power(np.abs(psi_s),2)
+    #        
+    #        for ii in range(1,len(probs)):
+    #            probs[ii]=probs[ii]+probs[ii-1] # accumulate prob ranges for easy 
+    #                                            # sampling with 0<alpha<1
+    #        for jj in range(N_samples):
+    #            a=np.random.rand()
+    #            samplepos[jj]=np.sum(probs<a)
+        
+        
+        
         # Accumulating Ppsi, which is psi_1(s)*psi_2(s)...*psi_L(s)
-        Ppsi=Ppsi*psi_s
+        Ppsi=Ppsi*psi_s    
+#    Ppsi=Ppsi+np.log(psi_s) 
+#    
+#    Ppsi=Ppsi+(vi_s-0.5*(np.log(np.sum(np.power(np.abs(exp_vi),2),1))))
+#Ppsi=np.exp(Ppsi) # may be more numerically stable
+#    print('\sum_s|Psi(s)|^2', np.sum(np.power(np.abs(Ppsi),2)))
+    #        Ppsi=Ppsi+(vi_s-0.5*(np.log(np.sum(np.power(np.abs(exp_vi),2),1))))
+        
+        # These are all be equivalent methods
+
+
 
     return Ppsi, new_s
 
-end = time.time(); print(end - start)
-
 '''################## Test Autoregressive Property #########################'''
-#L=2
-#nout=len(evals)*L
-## get each spin perm
-#s2=torch.tensor(np.array(list(itertools.product(evals,repeat=L))),dtype=torch.float)
-#
-#ppsi=psi_init(L,hidden_layer_sizes,len(evals)*L,'exponential')
-#
-## Joint probabilities
-#wvf,new_s=Autoregressive_pass(ppsi,s2,evals)
-#
-#def psi_i(ppsi, sn, ii, prev_psi=None):
-#    if ii==L: nlim=nout+1 
-#    else: nlim=nout  
-#    outc=ppsi.complex_out(sn)
-#    vi=outc[ii:nlim:L] # p(s0), p(s1)
-#    selection=(sn[ii].numpy()==evals)
-#    exp_vi=np.exp(vi) 
-#    norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2)))
-#    if not prev_psi==None:
-#        psi=(exp_vi[selection]/norm_const)*prev_psi
-#    else:        
-#        psi=exp_vi[selection]/norm_const 
-#        
-#    return psi
-#
-## computing the conditionals
-#ii, jj=0, 0 # lattice, sample number
-#psi0=psi_i(ppsi,s2[jj],ii) # first conditional psi0
-#psi1=psi_i(ppsi,s2[jj],ii+1)#,prev_psi=psi0) # second conditional psi1
-#                            # only enter prev_psi for full mult. conditional
-#
-## should be equal to the joint probability
-#psi00_c=psi0*psi1
-#print(wvf[0]-psi00_c)
+L=3
+nout=len(evals)*L
+# get each spin perm
+s2=torch.tensor(np.array(list(itertools.product(evals,repeat=L))),dtype=datatype)
+
+ppsi=psi_init(L,hidden_layer_sizes, nout, 'exponential', datatype)
+
+# Joint probabilities
+wvf,new_s=Autoregressive_pass(ppsi,s2,evals)
+
+def psi_i(ppsi, sn, ii, prev_psi=None):
+    outc=ppsi.complex_out(sn)
+    vi=outc[ii::L] # p(s0), p(s1)
+    selection=(sn[ii].numpy()==evals)
+    exp_vi=np.exp(vi) 
+    norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2)))
+    if not prev_psi==None:
+        psi=(exp_vi[selection]/norm_const)*prev_psi
+    else:        
+        psi=exp_vi[selection]/norm_const 
+    return psi
+
+# computing the conditionals
+ii, jj=0, 0 # lattice, sample number
+psi0=psi_i(ppsi,s2[jj],ii) # first conditional psi0
+psi1=psi_i(ppsi,s2[jj],ii+1)#,prev_psi=psi0) # second conditional psi1
+                            # only enter prev_psi for full mult. conditional
+if L==3: psi2=psi_i(ppsi,s2[jj],ii+2)
+else: psi2=1
+
+# should be equal to the joint probability
+psi00_c=psi0*psi1*psi2
+print(wvf[0]-psi00_c)
+
+'''################ Test Sample Distribution vs |Psi(s)|^2 #################'''
+
+def direct_sampling(wvf, N_samples):
+    
+    samplepos=np.zeros([N_samples,1]) # record the sampled states
+    probs=np.power(np.abs(wvf),2)
+    
+    for ii in range(1,len(probs)):
+        probs[ii]=probs[ii]+probs[ii-1] # accumulate prob ranges for easy 
+                                        # sampling with 0<alpha<1
+    
+    for jj in range(N_samples):
+        a=np.random.rand()
+        samplepos[jj]=np.sum(probs<a)
+    
+    return samplepos
+
+ppsi=psi_init(L,hidden_layer_sizes,nout,'exponential',datatype)
+
+s2=np.array(list(itertools.product(evals,repeat=L)))
+wvf, new_s = Autoregressive_pass(ppsi,torch.tensor(s2,dtype=datatype),evals)
+
+plt.figure()
+plt.bar(range(0,len(s2)), abs(wvf)**2)
+plt.title('Probability distribution, |Psi(s)|^2')
+
+#N_samp_list = np.logspace(2,6,30)
+N_resamples=1 # doesn't really seem to help, default should be 1
+N_samp_list=[100000]
+avg_rel_err = np.zeros([len(N_samp_list),1])
+direct_sampling_err = np.zeros([len(N_samp_list),1])
+for kk in range(len(N_samp_list)):
+    N_samples=int(round(N_samp_list[kk]))
+    s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=datatype)
+    s=s0
+    for ll in range(N_resamples):
+        _,new_s=Autoregressive_pass(ppsi,s,evals)
+        samp_wvf,s = Autoregressive_pass(ppsi,new_s,evals)
+    s=s.numpy()
+
+    # evaluating direct sampling as comparison
+    samplepos = direct_sampling(wvf,N_samples) 
+
+    h=[]; ind=[]; h_direct=[]
+    for ii in range(0,len(s2)):
+        h.append(np.sum((np.sum(s==s2[ii],1)==L)))
+        ind.append(np.where(np.sum(s==s2[ii],1)==L))
+        h_direct.append(np.sum(samplepos==ii))
+
+    rel_err= np.abs(((abs(wvf)**2)-h/np.sum(h))/(abs(wvf)**2))
+    ds_err=np.abs(((abs(wvf)**2)-h_direct/np.sum(h_direct))/(abs(wvf)**2))
+    
+    direct_sampling_err[kk]=np.mean(ds_err)
+    avg_rel_err[kk]=np.mean(rel_err)
+
+    if len(N_samp_list)==1:
+        plt.figure()
+        plt.bar(range(0,len(s2)), h/np.sum(h))
+        plt.title('Histogram of Samples, autoregressive sampling with ' + str(N_samples) + ' samples' )
+
+        plt.figure()
+        plt.bar(range(0,len(s2)), h_direct/np.sum(h_direct))
+        plt.title('Histogram of Samples, direct sampling with ' + str(N_samples)+ ' samples')
+        
+        plt.figure()
+        plt.plot(rel_err,'o-')
+        plt.title('relative error of sample distribution for # samples=' + str(N_samples) )
+
+plt.figure()
+plt.plot(np.log10(N_samp_list),avg_rel_err,'o-')
+plt.plot(np.log10(N_samp_list),direct_sampling_err,'x-')
+plt.plot(np.log10(N_samp_list), 1/np.sqrt(N_samp_list),'.-')
+plt.xlabel('Log10(N_samples)'), plt.ylabel('Average Relative Error')
+plt.legend(('Autoregressive Relative Error','Direct Sampling Error', '1/sqrt(N_samples)'))
 
 '''################## Test Energy Calculation #########################'''
 
@@ -207,7 +389,7 @@ ppsi=psi_init(L,hidden_layer_sizes,len(evals)*L,'exponential')
 # get each spin perm
 s2=np.array(list(itertools.product(evals,repeat=L)))
 
-wvf,new_s=Autoregressive_pass(ppsi,torch.tensor(s2,dtype=torch.float),evals)
+wvf,new_s=Autoregressive_pass(ppsi,torch.tensor(s2,dtype=datatype),evals)
 wvf=wvf[:,None]
 
 E_sx=np.matmul(np.matmul(np.conjugate(wvf.T),H_sx),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
@@ -215,7 +397,7 @@ E_szsz=np.matmul(np.matmul(np.conjugate(wvf.T),H_szsz),wvf)/(np.matmul(np.conjug
 E_tot=np.matmul(np.matmul(np.conjugate(wvf.T),H_tot),wvf)/(np.matmul(np.conjugate(wvf.T),wvf))
 
 N_samples=10000
-s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=torch.float)
+s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=datatype)
 _,new_s=Autoregressive_pass(ppsi,s0,evals)
 start=time.time()
 _,s = Autoregressive_pass(ppsi,new_s,evals)
@@ -1168,3 +1350,4 @@ for n in range(N_iter):
 #new_s=original_net.Autoregressive_pass(torch.tensor(s2,dtype=torch.float),evals)
 #s=original_net.Autoregressive_pass(new_s,evals)
 #[H_nn_ex, H_b_ex]=original_net.O_local(nn_interaction,s.numpy()),original_net.O_local(b_field,s.numpy())
+

@@ -20,9 +20,8 @@ import torch.nn as nn
 import numpy as np
 from NQS_pytorch import Op, Psi, kron_matrix_gen
 import itertools
-import autograd_hacks # module that returns grad per sample
+from autograd_hacks_master import autograd_hacks
 import time
-
 
 # system parameters
 b=0.5   # b-field strength
@@ -131,17 +130,27 @@ mult=torch.tensor(2*np.imag(-np.conj(E_loc)),dtype=torch.float)
 
 ppsi_mod.imag_comp.zero_grad()
 
+ppsi_mod.imag_comp.zero_grad()
+ppsi_mod.energy_gradient(s,E_loc)
+p_i=list(ppsi_mod.imag_comp.parameters())
+module_g0=p_i[0].grad[0][0]
+ppsi_mod.imag_comp.zero_grad()
+ppsi_mod.energy_gradient1(s,E_loc)
+p_i=list(ppsi_mod.imag_comp.parameters())
+module_g1=p_i[0].grad[0][0]
+
 #for param in modi_params:
 #    if len(param.size())==2:
 #        param.grad=torch.einsum("i,ijk->ijk",mult,param.grad1).mean(0)
 #    elif len(param.size())==1:
 #        param.grad=torch.einsum("i,ik->ik",mult,param.grad1).mean(0)
 
+ppsi_mod.imag_comp.zero_grad()
 (outi*mult[:,None]).mean().backward()
 #end=time.time(); print(end-start)
 
 pars=list(ppsi_mod.imag_comp.parameters())
-grad0=pars[0].grad 
+grad0=pars[0].grad[0][0].item() 
 modi_params=list(angle_net.imag_comp.parameters())
 
 #[p1_r,p1_i]=ppsi_mod.apply_energy_gradient(s,E_loc,np.mean(E_loc),0.03)
@@ -158,10 +167,10 @@ E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conju
 dif=(E_tot1-E_tot0)/dw
 
 print('\n\n #################### Angle ######################### \n',\
-      'Pytorch derivative: ', grad0[0][0].item(),\
-  '\n DE/dw with wavefunction: ', dif, ' \n pytorch derivative'\
-' relative error: ', np.abs(grad0[0][0].item()-dif)/dif,\
-'\n Ratio: ', grad0[0][0].item()/dif, '\n\n')
+      'Pytorch derivative: ', grad0,'\n DE/dw with wavefunction: '\
+  , dif, ' \n pytorch derivative relative error: ', \
+  np.abs(grad0-dif)/dif, '\n Ratio: ', grad0/dif, \
+  '\n method values: ',  module_g0.item(), module_g1.item(), '\n\n')
 
 print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), \
       '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
@@ -219,7 +228,7 @@ mult=torch.tensor((2*np.real(np.conj(E_loc)-np.conj(E0))))
 (outr.log()*mult[:,None]).mean().backward()
 
 pars=list(ppsi_mod.real_comp.parameters())
-grad0=pars[0].grad 
+grad0=pars[0].grad[0][0].item() 
 
 #[p1_r,p1_i]=ppsi_mod.apply_energy_gradient(s,E_loc,np.mean(E_loc),0.03)
 #print(p1_r-grad0) # testing to make sure algorithm is working the same.
@@ -235,11 +244,20 @@ E_tot0=np.matmul(np.matmul(np.conjugate(wvf0.T),H_tot),wvf0)/(np.matmul(np.conju
 E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conjugate(wvf1.T),wvf1))
 dif=(E_tot1-E_tot0)/dw
 
+ppsi_mod.real_comp.zero_grad()
+ppsi_mod.energy_gradient(s,E_loc)
+p_r=list(ppsi_mod.real_comp.parameters())
+module_g0=p_r[0].grad[0][0]
+ppsi_mod.real_comp.zero_grad()
+ppsi_mod.energy_gradient1(s,E_loc)
+p_r=list(ppsi_mod.real_comp.parameters())
+module_g1=p_r[0].grad[0][0]
+
 print('\n\n #################### Modulus ######################### \n',\
-      'Pytorch derivative: ', grad0[0][0].item(),
-  '\n DE/dw with wavefunction: ', dif, ' \n pytorch derivative'\
-' relative error: ', np.abs(grad0[0][0].item()-dif)/dif,\
-'\n Ratio: ', grad0[0][0].item()/dif, '\n\n')
+      'Pytorch derivative: ', grad0,'\n DE/dw with wavefunction: '\
+  , dif, ' \n pytorch derivative relative error: ', \
+  np.abs(grad0-dif)/dif, '\n Ratio: ', grad0/dif, \
+  '\n method values: ',  module_g0.item(), module_g1.item(), '\n\n')
 
 print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), 
       '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
@@ -285,11 +303,14 @@ psi0=ppsi_vec.complex_out(s).squeeze()
 E_loc=np.sum(H_nn+H_b,axis=1)
 E0=np.real(np.mean(E_loc))
 
+ppsi_vec.real_comp.zero_grad()
 autograd_hacks.add_hooks(ppsi_vec.real_comp)
 outr=ppsi_vec.real_comp(s)
 outr.mean().backward()
 autograd_hacks.compute_grad1(ppsi_vec.real_comp)
+autograd_hacks.clear_backprops(ppsi_vec.real_comp)
 
+m=1/psi0
 mult=torch.tensor(np.real(2*(np.conj(E_loc)-np.conj(E0))/psi0),dtype=torch.float)
 
 ppsi_vec.real_comp.zero_grad()
@@ -301,7 +322,8 @@ for param in pars:
         param.grad=torch.einsum("i,ijk->ijk",mult,param.grad1).mean(0)
     elif len(param.size())==1:
         param.grad=torch.einsum("i,ik->ik",mult,param.grad1).mean(0)    
-grad0=pars[0].grad 
+grad0=pars[0].grad[0][0].item()
+print(grad0)
 
 dw=0.001 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
@@ -313,11 +335,20 @@ E_tot0=np.matmul(np.matmul(np.conjugate(wvf0.T),H_tot),wvf0)/(np.matmul(np.conju
 E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conjugate(wvf1.T),wvf1))
 dif=(E_tot1-E_tot0)/dw
 
+real_net.real_comp.zero_grad()
+real_net.energy_gradient(s,E_loc,E0)
+p_r=list(real_net.real_comp.parameters())
+module_g0=p_r[0].grad[0][0]
+real_net.real_comp.zero_grad()
+real_net.energy_gradient1(s,E_loc,E0)
+p_r=list(real_net.real_comp.parameters())
+module_g1=p_r[0].grad[0][0]
+
 print('\n\n #################### Real COMP ######################### \n',\
-      'Pytorch derivative: ', grad0[0][0].item(),\
-  '\n DE/dw with wavefunction: ', dif, ' \n pytorch derivative'\
-' relative error: ', np.abs(grad0[0][0].item()-dif)/dif,\
-'\n Ratio: ', grad0[0][0].item()/dif, '\n\n')
+      'Pytorch derivative: ', grad0,'\n DE/dw with wavefunction: '\
+  , dif, ' \n pytorch derivative relative error: ', \
+  np.abs(grad0-dif)/dif, '\n Ratio: ', grad0/dif, \
+  '\n method values: ',  module_g0.item(), module_g1.item(), '\n\n')
 
 print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), 
       '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')
@@ -357,10 +388,20 @@ psi0=ppsi_vec.complex_out(s).squeeze() # the original psi
 E_loc=np.sum(H_nn+H_b,axis=1)
 E0=np.mean(E_loc) 
 
+imag_net.imag_comp.zero_grad()
+imag_net.energy_gradient(s,E_loc)
+p_r=list(imag_net.imag_comp.parameters())
+module_g0=p_r[0].grad[0][0]
+imag_net.imag_comp.zero_grad()
+imag_net.energy_gradient1(s,E_loc)
+p_r=list(imag_net.imag_comp.parameters())
+module_g1=p_r[0].grad[0][0]
+
 autograd_hacks.add_hooks(ppsi_vec.imag_comp)
 outi=ppsi_vec.imag_comp(s)
 outi.mean().backward()
 autograd_hacks.compute_grad1(ppsi_vec.imag_comp)
+autograd_hacks.clear_backprops(ppsi_vec.imag_comp)
 
 mult=torch.tensor(np.real(2j*(np.conj(E_loc)-np.conj(E0))/psi0),dtype=torch.float)
 
@@ -374,7 +415,7 @@ for param in pars:
     elif len(param.size())==1:
         param.grad=torch.einsum("i,ik->ik",mult,param.grad1).mean(0)    
 
-grad0=pars[0].grad 
+grad0=pars[0].grad[0][0].item()
 
 dw=0.001 # sometimes less accurate when smaller than 1e-3
 with torch.no_grad():
@@ -387,10 +428,10 @@ E_tot1=np.matmul(np.matmul(np.conjugate(wvf1.T),H_tot),wvf1)/(np.matmul(np.conju
 dif=(E_tot1-E_tot0)/dw
 
 print('\n\n #################### IMAG COMP ######################### \n',\
-   'Pytorch derivative: ', grad0[0][0].item(),\
-  '\n DE/dw with wavefunction: ', dif, ' \n pytorch derivative'\
-' relative error: ', np.abs(grad0[0][0].item()-dif)/dif,\
-'\n Ratio: ', grad0[0][0].item()/dif, '\n\n')
+      'Pytorch derivative: ', grad0,'\n DE/dw with wavefunction: '\
+  , dif, ' \n pytorch derivative relative error: ', \
+  np.abs(grad0-dif)/dif, '\n Ratio: ', grad0/dif, \
+  '\n method values: ',  module_g0.item(), module_g1.item(), '\n\n')
 
 print('Exact energy: ', E_tot0, '\n vs sampled energy: ', np.mean(E_loc), 
       '\n with relative error: ', np.abs(np.mean(E_loc)-E_tot0)/E_tot0,'\n\n')

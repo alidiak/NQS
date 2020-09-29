@@ -12,7 +12,7 @@ Here we keep classes and functions for the Pytorch Quantum States library.
 import itertools
 import numpy as np
 import torch
-import autograd_hacks
+from autograd_hacks_master import autograd_hacks
 
 class Op:
     
@@ -617,23 +617,23 @@ class Psi:
         nevals=len(evals)
         
         # Making sure it is an autoregressive model
-        assert nout/L==nevals,"(Output dim)!=nevals*(Input dim), not an Autoregressive NN"
+        assert nout%L==0,"(Output dim)!=int*(Input dim), not an Autoregressive NN"
                 
         # the full Psi is a product of the conditionals, making a running product easy
         self.wvf=np.ones([N_samples],dtype=np.complex128) 
         
+        if self.dtype==torch.double: prec=5e-15
+        else: prec=5e-7
+        
         for ii in range(0, L): # loop over lattice sites
             
-            if ii==L: nlim=nout+1 # conditions for slicing. Python doesn't take slice
-            else: nlim=nout       # if nout/L=int, so for ii=L, we need (nout+1)/L for 
-                                #  outc[:,nout] to be taken.
             si=s[:,ii] # the input/chosen si (maybe what I'm missing from prev code/E calc)
             # normalized probability/wavefunction
-            vi=outc[:,ii:nlim:L] 
+            vi=outc[:,ii::L] 
             # The MADE is prob0 for 0-nin outputs and then prob1 for 
             # nin-2nin outputs, etc. until ((nevals-1)-nevals)*nin outputs 
             tester=np.arange(0,nout);  # print(tester[ii:nlim:L]) # to see slices 
-            assert len(tester[ii:nlim:L])==nevals, "Network Output missing in calculation"
+            assert len(tester[ii::L])==nevals, "Network Output missing in calculation"
             
             exp_vi=np.exp(vi) # unnorm prob of evals 
             norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2),1))
@@ -656,7 +656,7 @@ class Psi:
                 psi_s+=prev_selection*1*psi[:,jj]
                 
                 # sampling if a<born_psi, sample
-                selection=((0<=rands)*(rands-born_psi[:,jj]<=5e-7)) 
+                selection=((0<=rands)*(rands-born_psi[:,jj]<=prec)) 
                 # Due to precision have to use <=1e-7 as errors will occur
                 # when comparing differences of order 1e-8. (see below check)
                 checker+=selection*1
