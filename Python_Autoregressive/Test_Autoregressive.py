@@ -86,39 +86,39 @@ hidden_layer_sizes=2*L
 #    return ppsi
 
 # NADE model by simonjisu
-from NADE_pytorch_master.model import NADE
-
-model_r=NADE(L,hidden_layer_sizes)
-model_i=NADE(L,hidden_layer_sizes)
-
-def psi_init(L, hidden_layer_sizes, nout=L, Form='exponential', dtype=torch.float):
-   
-    model_r=NADE(L,hidden_layer_sizes)
-    model_i=NADE(L,hidden_layer_sizes)
-
-    ppsi=Psi(model_r,model_i, L, form=Form,dtype=datatype, autoregressive=True)
-    
-    return ppsi
+#from NADE_pytorch_master.model import NADE
+#
+#model_r=NADE(L,hidden_layer_sizes)
+#model_i=NADE(L,hidden_layer_sizes)
+#
+#def psi_init(L, hidden_layer_sizes, nout=L, Form='exponential', dtype=torch.float):
+#   
+#    model_r=NADE(L,hidden_layer_sizes)
+#    model_i=NADE(L,hidden_layer_sizes)
+#
+#    ppsi=Psi(model_r,model_i, L, form=Form,dtype=datatype, autoregressive=True)
+#    
+#    return ppsi
 
 #The MADE coded by Andrej Karpath uses Masks to ensure that the
 # autoregressive property is upheld. natural_ordering=False 
 # randomizes autoregressive ordering, while =True makes the autoregressive 
 # order p1=f(s_1),p2=f(s_2,s_1)
 
-#from models.pytorch_made_master.made import MADE
+from models.pytorch_made_master.made import MADE
 
-#hidden_layer_sizes=[2*L]
-#
-#def psi_init(L, hidden_layer_sizes,nout, Form='euler', dtype=torch.float):
-#    nat_ording=False
-#    model_r=MADE(L,hidden_layer_sizes, nout, \
-#                 num_masks=1, natural_ordering=nat_ording)
-#    model_i=MADE(L,hidden_layer_sizes, nout, \
-#                 num_masks=1, natural_ordering=nat_ording)
-#
-#    ppsi=Psi(model_r,model_i, L, form=Form,dtype=datatype, autoregressive=True)
-#    
-#    return ppsi
+hidden_layer_sizes=[2*L]
+
+def psi_init(L, hidden_layer_sizes,nout, Form='euler', dtype=torch.float):
+    nat_ording=False
+    model_r=MADE(L,hidden_layer_sizes, nout, \
+                 num_masks=1, natural_ordering=nat_ording)
+    model_i=MADE(L,hidden_layer_sizes, nout, \
+                 num_masks=1, natural_ordering=nat_ording)
+
+    ppsi=Psi(model_r,model_i, L, form=Form,dtype=datatype, autoregressive=True)
+    
+    return ppsi
 
 '''############### Autoregressive Sampling and Psi ########################'''
 
@@ -310,6 +310,7 @@ print(wvf[0]-psi00_c)
 
 '''################ Test Sample Distribution vs |Psi(s)|^2 #################'''
 
+
 def direct_sampling(wvf, N_samples):
     
     samplepos=np.zeros([N_samples,1]) # record the sampled states
@@ -325,27 +326,35 @@ def direct_sampling(wvf, N_samples):
     
     return samplepos
 
-ppsi=psi_init(L,hidden_layer_sizes,nout,'exponential',datatype)
+#ppsi=psi_init(L,hidden_layer_sizes,nout,'exponential',datatype)
+
+''' Alrighty, let's try the QNADE model I wrote (with some inspiration from the other libs of course) '''
+
+from qnade import QNADE
+ppsi = QNADE(L, L, [-1,1])
 
 s2=np.array(list(itertools.product(evals,repeat=L)))
-wvf, new_s = Autoregressive_pass(ppsi,torch.tensor(s2,dtype=datatype),evals)
+#wvf, new_s = Autoregressive_pass(ppsi,torch.tensor(s2,dtype=datatype),evals)
+wvf, _ = ppsi(x=torch.tensor(s2,dtype=datatype))
 
 plt.figure()
 plt.bar(range(0,len(s2)), abs(wvf)**2)
 plt.title('Probability distribution, |Psi(s)|^2')
 
-#N_samp_list = np.logspace(2,6,30)
+N_samp_list = np.logspace(3,7,20)
 N_resamples=1 # doesn't really seem to help, default should be 1
-N_samp_list=[100000]
+#N_samp_list=[1000000]
 avg_rel_err = np.zeros([len(N_samp_list),1])
 direct_sampling_err = np.zeros([len(N_samp_list),1])
 for kk in range(len(N_samp_list)):
     N_samples=int(round(N_samp_list[kk]))
-    s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=datatype)
-    s=s0
-    for ll in range(N_resamples):
-        _,new_s=Autoregressive_pass(ppsi,s,evals)
-        samp_wvf,s = Autoregressive_pass(ppsi,new_s,evals)
+#    s0=torch.tensor(np.random.choice(evals,[N_samples,L]),dtype=datatype)
+#    s=s0
+#    for ll in range(N_resamples):
+#        _,new_s=Autoregressive_pass(ppsi,s,evals)
+#        samp_wvf,s = Autoregressive_pass(ppsi,new_s,evals)
+    
+    alt_wvf, s = ppsi(N_samples)
     s=s.numpy()
 
     # evaluating direct sampling as comparison
@@ -435,7 +444,7 @@ with torch.no_grad():
     pars1[0][0][0]=pars1[0][0][0]+dw
 
 # Choose a specific s
-s=torch.tensor(np.random.choice(evals,[1,L]),dtype=torch.float)
+s=torch.tensor(np.random.choice(evals,[1,L]),dtype=datatype)
 
 # First test the autodifferentiation:
 if not hasattr(original_net.real_comp,'autograd_hacks_hooks'):             

@@ -62,14 +62,21 @@ H=2*L # hidden layer size
 
 # creates an instance of the Sequential class nn.Sigmoid etc usually in forward section
 real_net=nn.Sequential(nn.Linear(L,H), nn.Sigmoid(), nn.Linear(H,1), nn.LogSigmoid())#,nn.Softplus())#,nn.Sigmoid()) 
+#autoreg_real_net=nn.Sequential(nn.Linear(L,H), # nn.Sigmoid(), nn.Linear(H,H), \
+#    nn.Sigmoid(), nn.Linear(H,len(evals)*L)) # for autoregressive final layer must be nevals*L
+#autoreg_imag_net=nn.Sequential(nn.Linear(L,H), #nn.Sigmoid(), nn.Linear(H,H), \
+#    nn.Sigmoid(), nn.Linear(H,len(evals)*L)) 
 #real_net=nn.Sequential(nn.Linear(L,1))#,nn.Softplus())#,nn.Sigmoid()) 
 # Always be careful of activation layers that result in exactly 0. (1/Psi->nan) in O_loc 
 
 H2=2*L
 imag_net=nn.Sequential(nn.Linear(L,H2),nn.Sigmoid(),nn.Linear(H2,1,bias=False))#,nn.Sigmoid()) 
+
 #imag_net=nn.Sequential(nn.Linear(L,1,bias=False))#,nn.Sigmoid(),nn.Linear(H2,1,bias=False),nn.Softplus())#,nn.Sigmoid()) 
 # always set bias=False for imaginary comp if using exponential or euler forms 
 # otherwise there is a strong bias term that is an artifact (& leads to singular values)
+
+
 
 # Test complex wavefunction object construction with modulus and angle
 ppsi=Psi(real_net,imag_net, L, form='euler',dtype=datatype)

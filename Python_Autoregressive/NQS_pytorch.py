@@ -6,12 +6,13 @@ Created on Tue May 12 14:26:01 2020
 Here we keep classes and functions for the Pytorch Quantum States library.
 
 
-@author: alex
+@author: Alex Lidiak
 """
 
 import itertools
 import numpy as np
 import torch
+import torch.nn as nn
 from autograd_hacks_master import autograd_hacks
 
 class Op:
@@ -32,7 +33,7 @@ class Op:
 class Psi:
     ''' potential improvement of the above class would be to make s a property 
     (less re-entering of s). '''
-    def __init__(self,real_comp,imag_comp,L, form='euler', dtype=torch.float,
+    def __init__(self, real_comp, imag_comp, L, evals=None, form='euler', dtype=torch.float,
                  autoregressive=False):
         # options for form are 'euler' or 'vector' - corresponding to 2 forms 
         # of complex number notation
@@ -43,10 +44,11 @@ class Psi:
         self.re=False
         if self.form.lower()=='real': self.re=True # no imag_comp if net is real
         
-        # Boolean of the class specifying if it is an autoregressive model
-        self.autoregressive=autoregressive # default is false
-        if self.autoregressive: # Adding autoregressive specific properties
-            self.wvf=0 # accumulated psi
+        # TODO: make sure evals can be arbitrary list and still be compatible
+        if evals is None: 
+            spin = 0.5 # presumambly will be entered by the user in later versions
+            self.evals=2*np.arange(-spin,spin+1)
+        else: self.evals=np.array(evals)
         
         # Code for adjusting class to different datatypes
         if isinstance(dtype,str):
@@ -63,23 +65,41 @@ class Psi:
             self.real_comp=real_comp
             if not self.re: self.imag_comp=imag_comp
             self.complextype=np.complex64
-                    
+            
+        # Boolean of the class specifying if it is an autoregressive model
+        self.autoregressive=autoregressive # default is false
+        if self.autoregressive: # Adding autoregressive specific properties
+            self.wvf=0 # accumulated psi
+            
+            # These are extra properties/traits the Autoregressive QNADE code needs
+            self.supported_layers = ['Linear'] # TODO: add 'conv' was capability is added
+            assert(self.L==imag_comp[0].in_features), 'incompatible real and imaginary input sizes'
+            assert(self.L*len(self.evals)==self.real_comp[-1].out_features), \
+            'The final/output layer size must be equal to the system size times the number of evals'
+            
+            
     # Method to return the complex number specified by the state of the 
     # 2 ANNs real_comp and imag_comp and an input state s
     def complex_out(self, s): # complex number for each sample
+        
         if not self.form.lower()=='real':
             self.complex=np.zeros(s.size(0),dtype=self.complextype)
+            
         if self.form.lower()=='euler':
             self.complex=self.real_comp(s).detach().numpy()*    \
             np.exp(1j*self.imag_comp(s).detach().numpy())
+            
         elif self.form.lower()=='vector':
             self.complex=self.real_comp(s).detach().numpy()+    \
             1j*self.imag_comp(s).detach().numpy()
+            
         elif self.form.lower()=='exponential':
             self.complex=np.exp(self.real_comp(s).detach().numpy()+    \
             1j*self.imag_comp(s).detach().numpy())
+            
         elif self.form.lower()=='real':
             self.complex=self.real_comp(s).detach().numpy()
+            
         else:
             raise Warning('Specified form', self.form, ' for complex number is'\
             ' ambiguous, use either "euler": real_comp*e^(i*imag_comp), "vector":'\
@@ -88,6 +108,7 @@ class Psi:
             self.form='euler'
             self.complex=self.real_comp(s).detach().numpy()*    \
             np.exp(1j*self.imag_comp(s).detach().numpy())
+            
         return self.complex
 
     '''############################ O_local #######################################
@@ -113,11 +134,8 @@ class Psi:
                                             # former is often equal to L (lat size) if applied to all sites
         [N_samples,L]=np.shape(s)  # Get the number of samples and lattice size from samples
             
-        # For now, assuming we are working in the Sz basis with spin=1/2
-        spin=0.5 # presumambly will be entered by the user in later versions
-        dim = int(2*spin+1)
-        evals=2*np.arange(-spin,spin+1)
-        # multiplied by 2 simply because integers are easier to work with
+        evals=self.evals
+        dim=int(len(evals))   
         
         op_size=np.log((np.shape(operator.matrix)[0]))/np.log(dim)
         if not op_size==op_span:
@@ -183,11 +201,8 @@ class Psi:
                 # 1 state = (1,0) and -1 state = (0,1) convention.
                 
                 if self.autoregressive:
-                    self.Autoregressive_pass(torch.tensor(s_prime,\
-                    dtype=self.dtype),evals)
-                    wvf_prime=self.wvf
-                    self.Autoregressive_pass(torch.tensor(s,\
-                    dtype=self.dtype),evals)
+                    wvf_prime, _ = self.QNADE_pass(x=torch.tensor(s_prime,dtype=self.dtype))
+                    _, _ = self.QNADE_pass(x=torch.tensor(s,dtype=self.dtype)) # will update self.wvf
                     log_psi_diff=np.log(wvf_prime)-np.log(self.wvf)
                     O_loc[:,i]+= xformed_state[:,kk]*np.exp(log_psi_diff)
                 elif self.form.lower()=='real': # log sensitive when real
@@ -391,7 +406,7 @@ class Psi:
             E_grad[rr]=np.zeros([sz1,sz2],dtype=complex)
             gradii[rr]=np.zeros([N_samples,sz1,sz2,len(evals)])
             
-        ## Accumulate O_omega1 over lattice sites (also have to see which s where used)
+        ## Accumulate O_omega1 over lattice sites (also have to see which s were used)
         for ii in range(0, self.L): # loop over lattice sites
             N_samples=s.shape[0]
             vi=outc[:,ii::self.L] 
@@ -401,7 +416,7 @@ class Psi:
             norm_term=np.sum(exp_t,1)
                     
             for kk in range(len(evals)): # have to get the dpsi separately FROM EACH OUTPUT vi
-        #        original_net.real_comp.zero_grad()
+
                 psi_i[:,kk].mean().backward(retain_graph=True) # mean necessary over samples
                                                     # grad1 will save the per sample grad
                 autograd_hacks.compute_grad1(model)
@@ -552,7 +567,7 @@ class Psi:
             raise ValueError('Either the eigenvalues of the system or the spin\
                              must be entered')
                 
-        # the rule for flipping/rotating a spin between it's eigenvalues
+        # var rot: the rule for flipping/rotating a spin between it's eigenvalues
         if rot is None:
             if spin is None:
                 dim=len(evals)
@@ -580,7 +595,7 @@ class Psi:
                 alt_state[pos] = np.real(np.exp(1j*rot)*alt_state[pos]) # flip next random position for spin
             else:
                 alt_state[pos] = np.real(np.exp(-1j*rot)*alt_state[pos]) # same chance to flip other direction
-            # Will have to generalize to complex vals sometime
+            # TODO: will have to generalize to complex evals
             
             # Probabilty of the next state divided by the current
             ln_prob=2*(np.log(np.abs(self.complex_out(torch.tensor(alt_state,dtype=self.dtype))))\
@@ -594,91 +609,156 @@ class Psi:
 
             if A ==1: self.samples[n+1,:]=alt_state
             else: 
-                if np.random.rand()<A: self.samples[n+1,:]=alt_state # accepting move with prob
+                if np.random.rand()<A: self.samples[n+1,:]=alt_state # accepting move with prob A
                 else: self.samples[n+1,:] = self.samples[n,:]
             
         return self.samples
     
     '''########## Autoregressive Sampling and Ppsi Gen function ############'''
-    # Begin the autoregressive sampling and Psi forward pass routine 
-    def Autoregressive_pass(self,s,evals):
-        
-        outc=self.complex_out(s) # the complex output given an ansatz form  
-        new_s=torch.zeros_like(s)
-        
-        if len(s.shape)==2:
-            [N_samples,L]=s.shape
-            nout=outc.shape[1]
-        else:
-            [N_samples,L]=1,s.shape[0]
-            nout=outc.shape[0]
-            outc, new_s=outc[None,:], new_s[None,:] # extra dim for calcs
-        
-        nevals=len(evals)
-        
-        # Making sure it is an autoregressive model
-        assert nout%L==0,"(Output dim)!=int*(Input dim), not an Autoregressive NN"
+           
+    def QNADE_pass(self, N_samples=None, x=None, grad_required=False): 
                 
+        if N_samples is None and x is None: 
+            raise ValueError('Must enter spin states for Psi calculation or the number of samples to be generated')
+        if N_samples is None and x is not None: N_samples, sample = x.shape[0], False
+        if N_samples is not None and x is None: sample = True
+                
+        real_modules = list(self.real_comp.children())
+        imag_modules = list(self.imag_comp.children())
+                
+        for jj in range(len(real_modules)):
+            if real_modules[jj].__class__.__name__ in self.supported_layers:
+                last_linear_r = jj
+        
+        for jj in range(len(imag_modules)):
+            if imag_modules[jj].__class__.__name__ in self.supported_layers:
+                last_linear_i = jj
+        
+        # a_0, d=0 is set to c (hidden layer bias), and updated on each run. 
+        # Expanded to be sample size by L
+        a_dr = real_modules[0].bias.expand(N_samples,-1)
+        a_di = imag_modules[0].bias.expand(N_samples,-1)
+        
         # the full Psi is a product of the conditionals, making a running product easy
-        self.wvf=np.ones([N_samples],dtype=np.complex128) 
+        PPSI=np.ones([N_samples],dtype=np.complex128) # if multiplying
+        #PPSI=np.zeros([N_samples],dtype=np.complex128)  # if adding logs
         
-        if self.dtype==torch.double: prec=5e-15
-        else: prec=5e-7
+        # number of outputs we must get for the output layer
+        nevals = len(self.evals)
         
-        for ii in range(0, L): # loop over lattice sites
+        for d in range(self.L):
             
-            si=s[:,ii] # the input/chosen si (maybe what I'm missing from prev code/E calc)
-            # normalized probability/wavefunction
-            vi=outc[:,ii::L] 
-            # The MADE is prob0 for 0-nin outputs and then prob1 for 
-            # nin-2nin outputs, etc. until ((nevals-1)-nevals)*nin outputs 
-            tester=np.arange(0,nout);  # print(tester[ii:nlim:L]) # to see slices 
-            assert len(tester[ii::L])==nevals, "Network Output missing in calculation"
+            # This is the hidden/final layer activation
+            # rough way to test if it is a layer or an activation
+            if not isinstance(real_modules[1], nn.Linear): h_dr, lin_ind_r = real_modules[1](a_dr), 2
+            else: h_dr, lin_ind_r = a_dr, 1
+            if not isinstance(imag_modules[1], nn.Linear): h_di, lin_ind_i = imag_modules[1](a_di), 2
+            else: h_di, lin_ind_i = a_di, 1
             
+            # Otherwise, the next module is a linear x-form implying no activation
+            # need to ensure the last layer has nevals number of outputs, others are unchanged
+            if last_linear_r==lin_ind_r: d1, d2 = nevals*d, nevals*(d+1)  
+            else: d1, d2 = 0, len(real_modules[lin_ind_r].bias)
+            # initialize the vi_dr (can be x-formed by supplementary layers)
+            vi_dr = h_dr.mm(real_modules[lin_ind_r].weight[d1:d2,:].t())\
+                    +real_modules[lin_ind_r].bias[d1:d2] 
+
+            if last_linear_i==lin_ind_i: d1, d2 = nevals*d, nevals*(d+1)  
+            else: d1, d2 = 0, len(imag_modules[lin_ind_i].bias)
+            vi_di = h_di.mm(imag_modules[lin_ind_i].weight[d1:d2,:].t())\
+                    +imag_modules[lin_ind_i].bias[d1:d2] 
+            
+            # TODO: in paper they use conv layers, adding capability to deal with 
+            # this layer type could improve performance, also could be a way to 
+            # rescale layers as needed (to fit to nevals*L at last layer). 
+            # Calculate the x-formation from visible layer to output layer (v_i)
+            
+            for layer in real_modules[(lin_ind_r+1):len(real_modules)]: 
+            # skip first 2 linear layers (used last to update a_d, vi_d above) & activation (used on h_d above)
+                if isinstance(layer, nn.Linear):
+                    if layer == real_modules[last_linear_r]: d1, d2 = nevals*d, nevals*(d+1)
+                    else:  d1, d2 = 0, len(real_modules[lin_ind_r].bias)
+                    vi_dr = vi_dr.mm(layer.weight[d1:d2,:].t())+layer.bias[d1:d2] 
+                else: vi_dr = layer(vi_dr)
+                                 
+            for layer in imag_modules[(lin_ind_i+1):len(imag_modules)]: 
+                if isinstance(layer, nn.Linear):
+                    if layer == imag_modules[last_linear_r]: d1, d2 = nevals*d, nevals*(d+1)
+                    else:  d1, d2 = 0, len(imag_modules[lin_ind_i].bias)
+                    vi_di = vi_di.mm(layer.weight[d1:d2,:].t())+layer.bias[d1:d2] 
+                else: vi_di = layer(vi_di)            
+            
+            # The Quantum-NADE deviates from a NADE in having a real and imag comp
+            # Here we can use both vi to generate a complex vi that is the 
+            # basis of our calculations and sampling
+            # TODO add form options other than exponential
+            vi = np.exp(vi_dr.detach().numpy()+1j*vi_di.detach().numpy())
+            
+            # TODO create a variable to accumulate the gradients of psi_r (vi_dr)
+            # and psi_i (vi_di) (can be used for full grad)
+#            if grad_required:
+#                    
+#                for n in range(N_samples):
+#                    for j in range(len(self.evals)):
+#                        vi_dr[n,j].backward(retain_graph=True) # takes the mean over the samples
+#                        vi_di[n,j].backward(retain_graph=True)
+            
+            # Normalization and formation of the conditional psi
             exp_vi=np.exp(vi) # unnorm prob of evals 
             norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2),1))
-            psi=np.einsum('ij,i->ij', exp_vi, 1/norm_const) # love this tool
+            psi=np.einsum('ij,i->ij', exp_vi, 1/norm_const) 
             
-            born_psi=np.power(np.abs(psi),2)
-            
-            # satisfy the normalization condition?
-#            assert np.all(np.sum(born_psi,1)-1<1e-6), "Psi not normalized correctly"
-        
-            # Now let's sample from the binary distribution
-            rands=np.random.rand(N_samples)
-            
-            psi_s=np.zeros(N_samples, complex) # needed to accumulate Ppsi
-            checker=np.zeros(N_samples)
-            for jj in range(nevals): 
-                        
-                prev_selection=(si.numpy()==evals[jj]) # which s were sampled 
-                # psi(s), accumulate psi for the s that were used to gen samples
-                psi_s+=prev_selection*1*psi[:,jj]
+            # Sampling probability is determined by the born rule in QM
+            if sample:
+                born_psi=np.power(np.abs(psi),2)
+                assert np.all(np.sum(born_psi,1)-1<1e-6), "Psi not normalized correctly"
                 
-                # sampling if a<born_psi, sample
-                selection=((0<=rands)*(rands-born_psi[:,jj]<=prec)) 
-                # Due to precision have to use <=1e-7 as errors will occur
-                # when comparing differences of order 1e-8. (see below check)
-                checker+=selection*1
+                # sampling routine:
+                probs = born_psi.copy()
+                for ii in range(1, probs.shape[1]): # accumulate prob ranges for easy 
+                    probs[:,ii] = probs[:,ii]+probs[:,ii-1] # sampling with 0<alpha<1
                 
-                new_s[selection,ii]=evals[jj]
-        
-                rands=rands-born_psi[:,jj] # shifting the rands for the next sampling
+                a=np.random.rand(N_samples)[:,None]
+                samplepos=np.sum(probs<a,1) # find the sample position in eval list
+                
+                # corrected error where sometimes a too large index occurs here
+                # This is a rough fix... But not sure what a better way to ensure it would be
+                if np.any(samplepos==len(self.evals)):
+                    samplepos[samplepos==len(self.evals)] -= 1 
+                
+                xd = torch.tensor(self.evals[samplepos], dtype=self.dtype) # sample
+                if len(xd.shape)==1:
+                    xd = xd[:,None]
+                if d==0:
+                    samples = xd 
+                else:
+                    samples = torch.cat((samples,xd),dim=1) 
+                # End sampling routine
             
-            if not np.all(checker)==1: 
-                prob_ind=np.where(checker==0)
-                raise ValueError("N_samples were not sampled. error at: \n", \
-                    prob_ind, '\n with random array: \n', rands[prob_ind],\
-                    '\n and probability array: \n', born_psi[prob_ind,:])
+            else:
+                xd = x[:,d:d+1]
+                if d==0: samples=xd # just checking the iterations
+                else: samples = torch.cat((samples,xd),dim=1) 
+                
+                # find the s_i for psi(s_i), which is to be accumulated for PPSI
+                samplepos = (xd==self.evals[1]).int().numpy().squeeze()
+                # TODO this definitely won't work for non-binary evals, need to
+                # extend functionality to any set of evals
             
-#            assert np.all(checker)==1, "N_samples were not sampled"
-            
-            # Accumulating Ppsi, which is psi_1(s)*psi_2(s)...*psi_L(s)
-            self.wvf=self.wvf*psi_s
-        
-        return new_s  
+            # NADE update rule, uses previously sampled x_d
+            a_dr = a_dr + xd.mm(real_modules[0].weight[:,d:(d+1)].t())+real_modules[0].bias
+            a_di = a_di + xd.mm(imag_modules[0].weight[:,d:(d+1)].t())+imag_modules[0].bias
 
-
+            # Multiplicitavely accumulate PPSI based on which sample (s) was sampled
+            PPSI=PPSI*psi[range(N_samples),samplepos]
+            
+            # PPSI may only make sense when inputing an x to get the wvf for...
+        
+        self.wvf=PPSI
+        
+        return PPSI, samples
+       
+        
 def kron_matrix_gen(op_list,D,N,bc):
     ''' this function generates a Hamiltonian when it consists of a sum
  of local operators. The local operator should be input at op and the 
@@ -1032,3 +1112,85 @@ def kron_matrix_gen(op_list,D,N,bc):
 #            autograd_hacks.clear_backprops(self.imag_comp)
 #            
 #        return 
+    
+
+
+    # Begin the autoregressive sampling and Psi forward pass routine 
+#    def Autoregressive_pass(self,s,evals):
+#        
+#        outc=self.complex_out(s) # the complex output given an ansatz form  
+#        new_s=torch.zeros_like(s)
+#        
+#        if len(s.shape)==2:
+#            [N_samples,L]=s.shape
+#            nout=outc.shape[1]
+#        else:
+#            [N_samples,L]=1,s.shape[0]
+#            nout=outc.shape[0]
+#            outc, new_s=outc[None,:], new_s[None,:] # extra dim for calcs
+#        
+#        nevals=len(evals)
+#        
+#        # Making sure it is an autoregressive model
+#        assert nout%L==0,"(Output dim)!=int*(Input dim), not an Autoregressive NN"
+#                
+#        # the full Psi is a product of the conditionals, making a running product easy
+#        self.wvf=np.ones([N_samples],dtype=np.complex128) 
+#        
+#        if self.dtype==torch.double: prec=5e-15
+#        else: prec=5e-7
+#        
+#        for ii in range(0, L): # loop over lattice sites
+#            
+#            si=s[:,ii] # the input/chosen si (maybe what I'm missing from prev code/E calc)
+#            # normalized probability/wavefunction
+#            vi=outc[:,ii::L] 
+#            # The MADE is prob0 for 0-nin outputs and then prob1 for 
+#            # nin-2nin outputs, etc. until ((nevals-1)-nevals)*nin outputs 
+#            tester=np.arange(0,nout);  # print(tester[ii:nlim:L]) # to see slices 
+#            assert len(tester[ii::L])==nevals, "Network Output missing in calculation"
+#            
+#            exp_vi=np.exp(vi) # unnorm prob of evals 
+#            norm_const=np.sqrt(np.sum(np.power(np.abs(exp_vi),2),1))
+#            psi=np.einsum('ij,i->ij', exp_vi, 1/norm_const) # love this tool
+#            
+#            born_psi=np.power(np.abs(psi),2)
+#            
+#            # satisfy the normalization condition?
+##            assert np.all(np.sum(born_psi,1)-1<1e-6), "Psi not normalized correctly"
+#        
+#            # Now let's sample from the binary distribution
+#            rands=np.random.rand(N_samples)
+#            
+#            psi_s=np.zeros(N_samples, complex) # needed to accumulate Ppsi
+#            checker=np.zeros(N_samples)
+#            for jj in range(nevals): 
+#                        
+#                prev_selection=(si.numpy()==evals[jj]) # which s were sampled 
+#                # psi(s), accumulate psi for the s that were used to gen samples
+#                psi_s+=prev_selection*1*psi[:,jj]
+#                
+#                # sampling if a<born_psi, sample
+#                selection=((0<=rands)*(rands-born_psi[:,jj]<=prec)) 
+#                # Due to precision have to use <=1e-7 as errors will occur
+#                # when comparing differences of order 1e-8. (see below check)
+#                checker+=selection*1
+#                
+#                new_s[selection,ii]=evals[jj]
+#        
+#                rands=rands-born_psi[:,jj] # shifting the rands for the next sampling
+#            
+#            if not np.all(checker)==1: 
+#                prob_ind=np.where(checker==0)
+#                raise ValueError("N_samples were not sampled. error at: \n", \
+#                    prob_ind, '\n with random array: \n', rands[prob_ind],\
+#                    '\n and probability array: \n', born_psi[prob_ind,:])
+#            
+##            assert np.all(checker)==1, "N_samples were not sampled"
+#            
+#            # Accumulating Ppsi, which is psi_1(s)*psi_2(s)...*psi_L(s)
+#            self.wvf=self.wvf*psi_s
+#        
+#        return new_s  
+
+
