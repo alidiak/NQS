@@ -1,5 +1,7 @@
 """
-Library for extracting interesting quantites from autograd, see README.md
+Library for extracting interesting quantites from autograd, 
+NOT MY WORK, source: https://github.com/cybertronai/autograd-hacks
+Credit cybertronai
 
 Not thread-safe because of module-level variables
 
